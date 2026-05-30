@@ -34,6 +34,7 @@ Useful options:
 - `SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned 8-bit I/Q
   bytes into complex samples, and appends them to a thread-safe `IQSampleBuffer`.
 - `FFTProcessorThread` waits until the buffer has at least one new FFT-sized
-  block, computes a windowed FFT, and publishes power spectra to a queue.
+  block, consumes that block from the buffer, computes a windowed FFT, and
+  publishes power spectra to a queue.
 - The main thread owns the Matplotlib GUI and consumes spectra from the queue to
   update the waterfall display.
