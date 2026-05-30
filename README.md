@@ -39,15 +39,21 @@ format, not a resolution chosen by this Python script. The script converts those
 process them conveniently, but that conversion does not add ADC resolution.
 
 Other SDR families can have wider ADCs or different host sample formats. To use
-one of those devices, replace `SDRReaderThread` with a reader for that hardware's
-API/stream format and keep the rest of the buffer, FFT, and display pipeline.
+one of those devices, replace `SDRReaderThread` in `sdr_reader.py` with a
+reader for that hardware's API/stream format and keep the rest of the buffer,
+FFT, and display pipeline.
 
 ## Threading model
 
-- `SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned 8-bit I/Q
-  bytes into complex samples, and appends them to a thread-safe `IQSampleBuffer`.
-- `FFTProcessorThread` waits until the buffer has at least one new FFT-sized
-  block, consumes that block from the buffer, computes a windowed FFT, and
-  publishes power spectra to a queue.
+- `sdr_reader.SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned
+  8-bit I/Q bytes into complex samples, and appends them to a thread-safe
+  `sdr_reader.IQSampleBuffer`.
+- `IQSampleBuffer` is initialized with a fixed maximum sample count (the
+  `--fft-size` multiplied by `--buffer-blocks`) so capture backlog memory remains
+  bounded. Its `wait_for_samples(sample_count, stop_event)` method lets a
+  processing thread block until exactly the requested number of fresh, previously
+  unconsumed samples is available.
+- `FFTProcessorThread` asks the buffer for one FFT-sized sample block, computes a
+  windowed FFT, and publishes power spectra to a queue.
 - The main thread owns the Matplotlib GUI and consumes spectra from the queue to
   update the waterfall display.
