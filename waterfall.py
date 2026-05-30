@@ -28,6 +28,7 @@ import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
+from audio_output import AudioPlaybackThread, AudioSampleQueue
 from sdr_reader import IQSampleBuffer, SDRReaderThread
 
 if TYPE_CHECKING:
@@ -69,6 +70,9 @@ class FFTProcessorThread(threading.Thread):
         sample_buffer: IQSampleBuffer,
         spectra_queue: "queue.Queue[np.ndarray[Any, Any]]",
         stop_event: threading.Event,
+        audio_queue: AudioSampleQueue | None = None,
+        audio_sample_rate: int | None = None,
+        audio_gain: float = 0.2,
     ) -> None:
         import numpy as np
 
@@ -77,6 +81,9 @@ class FFTProcessorThread(threading.Thread):
         self.sample_buffer = sample_buffer
         self.spectra_queue = spectra_queue
         self.stop_event = stop_event
+        self.audio_queue = audio_queue
+        self.audio_sample_rate = audio_sample_rate
+        self.audio_gain = audio_gain
         # A Hann window reduces FFT spectral leakage so narrow signals smear
         # less into neighboring bins in the displayed spectrum.
         self.window = np.hanning(config.fft_size).astype(np.float32)
@@ -92,6 +99,8 @@ class FFTProcessorThread(threading.Thread):
             if block is None:
                 continue
 
+            self._push_audio_samples(block)
+
             # FFT bins are shifted so negative offsets appear on the left, the
             # tuned center frequency appears in the middle, and positive offsets
             # appear on the right.
@@ -106,6 +115,21 @@ class FFTProcessorThread(threading.Thread):
             except queue.Full:
                 # Drop frames if the GUI cannot keep up; the newest rows matter most.
                 pass
+
+    def _push_audio_samples(self, block: "np.ndarray[Any, Any]") -> None:
+        """Push a simple downsampled monitor stream to the audio queue, if enabled."""
+        import numpy as np
+
+        if self.audio_queue is None or self.audio_sample_rate is None:
+            return
+
+        # This is a lightweight audio monitor path rather than a full AM/FM/SSB
+        # demodulator. It lets downstream code hear a bounded, real-valued view
+        # of processed samples while keeping playback rate independent of SDR
+        # sample rate.
+        decimation = max(1, round(self.config.sample_rate / self.audio_sample_rate))
+        audio_samples = np.real(block[::decimation]).astype(np.float32)
+        self.audio_queue.push_samples(audio_samples * self.audio_gain)
 
 
 class WaterfallDisplay:
@@ -201,13 +225,16 @@ class WaterfallDisplay:
         self._plt.show()
 
 
-def missing_runtime_dependencies() -> list[str]:
+def missing_runtime_dependencies(enable_audio: bool = False) -> list[str]:
     """Return Python packages needed to run the live waterfall that are missing."""
     # Checking with importlib keeps argument parsing usable in a fresh checkout;
     # the expensive imports happen only after we know the packages are present.
+    required_packages = ["numpy", "matplotlib"]
+    if enable_audio:
+        required_packages.append("sounddevice")
     return [
         package
-        for package in ("numpy", "matplotlib")
+        for package in required_packages
         if importlib.util.find_spec(package) is None
     ]
 
@@ -220,7 +247,9 @@ def parse_gain(value: str) -> str | float:
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Threaded RTL-SDR waterfall display skeleton")
+    parser = argparse.ArgumentParser(
+        description="Threaded RTL-SDR waterfall display skeleton"
+    )
     parser.add_argument(
         "--center-freq",
         type=float,
@@ -280,12 +309,46 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default="rtl_sdr",
         help="Path to the rtl_sdr executable used for sample capture",
     )
+    parser.add_argument(
+        "--enable-audio",
+        action="store_true",
+        help="Enable a simple mono audio monitor from processed samples",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=48_000,
+        help="Audio playback sample rate in samples/sec",
+    )
+    parser.add_argument(
+        "--audio-block-size",
+        type=int,
+        default=1024,
+        help="Audio samples written to the sound device per block",
+    )
+    parser.add_argument(
+        "--audio-buffer-seconds",
+        type=float,
+        default=0.5,
+        help="Maximum queued audio backlog in seconds",
+    )
+    parser.add_argument(
+        "--audio-gain",
+        type=float,
+        default=0.2,
+        help="Linear gain applied before samples are queued for audio playback",
+    )
+    parser.add_argument(
+        "--audio-device",
+        default=None,
+        help="Optional sounddevice output device name or index",
+    )
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    missing_packages = missing_runtime_dependencies()
+    missing_packages = missing_runtime_dependencies(enable_audio=args.enable_audio)
     if missing_packages:
         print(
             "Missing Python package(s): "
@@ -312,7 +375,24 @@ def main() -> int:
     # queue bridges the processor and GUI. Keeping these as separate handoff
     # points makes it clear which thread owns each stage of the pipeline.
     sample_buffer = IQSampleBuffer(max_samples=args.fft_size * args.buffer_blocks)
-    spectra_queue: "queue.Queue[np.ndarray[Any, Any]]" = queue.Queue(maxsize=args.waterfall_rows)
+    spectra_queue: "queue.Queue[np.ndarray[Any, Any]]" = queue.Queue(
+        maxsize=args.waterfall_rows
+    )
+    audio_queue: AudioSampleQueue | None = None
+    audio_thread: AudioPlaybackThread | None = None
+    if args.enable_audio:
+        max_audio_samples = max(
+            args.audio_block_size,
+            round(args.audio_sample_rate * args.audio_buffer_seconds),
+        )
+        audio_queue = AudioSampleQueue(max_samples=max_audio_samples)
+        audio_thread = AudioPlaybackThread(
+            audio_queue,
+            sample_rate=args.audio_sample_rate,
+            block_size=args.audio_block_size,
+            stop_event=stop_event,
+            device=args.audio_device,
+        )
 
     def request_shutdown(signum: int, _: object) -> None:
         print(f"Received signal {signum}; shutting down...")
@@ -321,15 +401,27 @@ def main() -> int:
         # blocking stdout read, while wake_waiters releases the processor condition.
         reader.stop()
         sample_buffer.wake_waiters()
+        if audio_queue is not None:
+            audio_queue.wake_waiters()
 
     reader = SDRReaderThread(config, sample_buffer, stop_event)
-    processor = FFTProcessorThread(config, sample_buffer, spectra_queue, stop_event)
+    processor = FFTProcessorThread(
+        config,
+        sample_buffer,
+        spectra_queue,
+        stop_event,
+        audio_queue=audio_queue,
+        audio_sample_rate=args.audio_sample_rate if args.enable_audio else None,
+        audio_gain=args.audio_gain,
+    )
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
     reader.start()
     processor.start()
+    if audio_thread is not None:
+        audio_thread.start()
 
     try:
         WaterfallDisplay(config, spectra_queue).start(stop_event)
@@ -339,8 +431,12 @@ def main() -> int:
         stop_event.set()
         reader.stop()
         sample_buffer.wake_waiters()
+        if audio_queue is not None:
+            audio_queue.wake_waiters()
         reader.join(timeout=2.0)
         processor.join(timeout=2.0)
+        if audio_thread is not None:
+            audio_thread.join(timeout=2.0)
 
     return 0
 
