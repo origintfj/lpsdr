@@ -29,6 +29,19 @@ Useful options:
 - `--min-db` / `--max-db`: color scale bounds.
 - `--rtl-sdr-path`: executable used for capture, default `rtl_sdr`.
 
+## I/Q sample resolution
+
+The `rtl_sdr` tool used by this example streams interleaved unsigned 8-bit I/Q
+bytes: one byte for I, then one byte for Q, repeated for each complex sample.
+For ordinary RTL-SDR dongles this is effectively the hardware/tool sample
+format, not a resolution chosen by this Python script. The script converts those
+8-bit byte values into floating-point complex numbers before the FFT so NumPy can
+process them conveniently, but that conversion does not add ADC resolution.
+
+Other SDR families can have wider ADCs or different host sample formats. To use
+one of those devices, replace `SDRReaderThread` with a reader for that hardware's
+API/stream format and keep the rest of the buffer, FFT, and display pipeline.
+
 ## Threading model
 
 - `SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned 8-bit I/Q
