@@ -5,8 +5,13 @@ This application uses one thread to continuously collect I/Q samples from an
 RTL-SDR device, a second thread to turn sample blocks into FFT power spectra,
 and the main thread to render a live waterfall display.
 
+The reader uses the standard ``rtl_sdr`` command-line program rather than the
+``pyrtlsdr`` Python bindings. That keeps the skeleton compatible with systems
+where the installed Python package expects newer ``librtlsdr`` symbols than the
+host library provides.
+
 Dependencies:
-    pip install numpy matplotlib pyrtlsdr
+    pip install numpy matplotlib
 
 Example:
     python3 waterfall.py --center-freq 100.1e6 --sample-rate 2.4e6 --gain auto
@@ -15,19 +20,20 @@ Example:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import queue
+import shutil
 import signal
+import subprocess
+import sys
 import threading
 from collections import deque
 from dataclasses import dataclass
-from typing import Deque, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.animation import FuncAnimation
-from matplotlib.image import AxesImage
-
-from rtlsdr import RtlSdr
+if TYPE_CHECKING:
+    import numpy as np
+    from matplotlib.image import AxesImage
 
 
 @dataclass(frozen=True)
@@ -42,18 +48,21 @@ class RadioConfig:
     waterfall_rows: int
     min_db: float
     max_db: float
+    rtl_sdr_path: str
 
 
 class IQSampleBuffer:
     """Thread-safe buffer for complex I/Q samples from the SDR."""
 
     def __init__(self, max_samples: int) -> None:
-        self._samples: Deque[np.complex64] = deque(maxlen=max_samples)
+        self._samples: deque[complex] = deque(maxlen=max_samples)
         self._condition = threading.Condition()
         self._total_written = 0
 
-    def append(self, samples: np.ndarray) -> None:
+    def append(self, samples: "np.ndarray[Any, Any]") -> None:
         """Append a batch of complex samples and notify waiting consumers."""
+        import numpy as np
+
         complex_samples = np.asarray(samples, dtype=np.complex64)
         with self._condition:
             self._samples.extend(complex_samples)
@@ -66,7 +75,7 @@ class IQSampleBuffer:
         last_total_seen: int,
         stop_event: threading.Event,
         timeout: float = 0.25,
-    ) -> tuple[Optional[np.ndarray], int]:
+    ) -> tuple[Optional["np.ndarray[Any, Any]"], int]:
         """Wait until enough new samples are available and return one FFT block.
 
         The returned block is copied out of the shared buffer so processing can
@@ -74,6 +83,8 @@ class IQSampleBuffer:
         method wait for genuinely new samples rather than reprocessing the same
         buffer contents repeatedly.
         """
+        import numpy as np
+
         with self._condition:
             while not stop_event.is_set():
                 enough_samples = len(self._samples) >= block_size
@@ -91,7 +102,7 @@ class IQSampleBuffer:
 
 
 class SDRReaderThread(threading.Thread):
-    """Continuously read samples from the RTL-SDR into the I/Q buffer."""
+    """Continuously read samples from rtl_sdr into the I/Q buffer."""
 
     def __init__(
         self,
@@ -103,23 +114,73 @@ class SDRReaderThread(threading.Thread):
         self.config = config
         self.sample_buffer = sample_buffer
         self.stop_event = stop_event
+        self._process: subprocess.Popen[bytes] | None = None
+        self._process_lock = threading.Lock()
 
     def run(self) -> None:
-        sdr = RtlSdr()
         try:
-            sdr.sample_rate = self.config.sample_rate
-            sdr.center_freq = self.config.center_freq
-            if isinstance(self.config.gain, str) and self.config.gain.lower() == "auto":
-                sdr.gain = "auto"
-            else:
-                sdr.gain = float(self.config.gain)
-
-            while not self.stop_event.is_set():
-                samples = sdr.read_samples(self.config.read_size)
-                self.sample_buffer.append(samples)
+            self._read_from_rtl_sdr()
+        except Exception as exc:
+            print(f"SDR reader stopped: {exc}", file=sys.stderr)
+            self.stop_event.set()
         finally:
-            sdr.close()
+            self.stop()
             self.sample_buffer.wake_all()
+
+    def stop(self) -> None:
+        """Terminate the rtl_sdr child process, if it is still running."""
+        with self._process_lock:
+            process = self._process
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2.0)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2.0)
+
+    def _read_from_rtl_sdr(self) -> None:
+        import numpy as np
+
+        rtl_sdr = shutil.which(self.config.rtl_sdr_path)
+        if rtl_sdr is None:
+            raise RuntimeError(
+                f"Could not find '{self.config.rtl_sdr_path}'. Install rtl-sdr "
+                "or pass --rtl-sdr-path with the full executable path."
+            )
+
+        command = [
+            rtl_sdr,
+            "-f",
+            str(round(self.config.center_freq)),
+            "-s",
+            str(round(self.config.sample_rate)),
+        ]
+        if not (isinstance(self.config.gain, str) and self.config.gain.lower() == "auto"):
+            command.extend(["-g", str(self.config.gain)])
+        command.append("-")
+
+        process = subprocess.Popen(command, stdout=subprocess.PIPE)
+        with self._process_lock:
+            self._process = process
+
+        bytes_per_read = self.config.read_size * 2
+        while not self.stop_event.is_set():
+            if process.stdout is None:
+                raise RuntimeError("rtl_sdr stdout pipe was not created")
+
+            raw = process.stdout.read(bytes_per_read)
+            if not raw:
+                exit_code = process.poll()
+                raise RuntimeError(f"rtl_sdr exited before samples were available: {exit_code}")
+            if len(raw) < bytes_per_read:
+                continue
+
+            interleaved = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
+            normalized = (interleaved - 127.5) / 127.5
+            iq_samples = normalized[0::2] + 1j * normalized[1::2]
+            self.sample_buffer.append(iq_samples)
 
 
 class FFTProcessorThread(threading.Thread):
@@ -129,9 +190,11 @@ class FFTProcessorThread(threading.Thread):
         self,
         config: RadioConfig,
         sample_buffer: IQSampleBuffer,
-        spectra_queue: "queue.Queue[np.ndarray]",
+        spectra_queue: "queue.Queue[np.ndarray[Any, Any]]",
         stop_event: threading.Event,
     ) -> None:
+        import numpy as np
+
         super().__init__(name="fft-processor", daemon=True)
         self.config = config
         self.sample_buffer = sample_buffer
@@ -140,6 +203,8 @@ class FFTProcessorThread(threading.Thread):
         self.window = np.hanning(config.fft_size).astype(np.float32)
 
     def run(self) -> None:
+        import numpy as np
+
         last_total_seen = 0
         while not self.stop_event.is_set():
             block, last_total_seen = self.sample_buffer.wait_for_block(
@@ -164,7 +229,14 @@ class FFTProcessorThread(threading.Thread):
 class WaterfallDisplay:
     """Matplotlib-based waterfall display updated from processed FFT rows."""
 
-    def __init__(self, config: RadioConfig, spectra_queue: "queue.Queue[np.ndarray]") -> None:
+    def __init__(
+        self,
+        config: RadioConfig,
+        spectra_queue: "queue.Queue[np.ndarray[Any, Any]]",
+    ) -> None:
+        import matplotlib.pyplot as plt
+        import numpy as np
+
         self.config = config
         self.spectra_queue = spectra_queue
         self.waterfall = np.full(
@@ -173,7 +245,9 @@ class WaterfallDisplay:
             dtype=np.float32,
         )
         self.figure, self.axis = plt.subplots()
-        self.image: Optional[AxesImage] = None
+        self.image: Optional["AxesImage"] = None
+        self.animation: Any = None
+        self._plt = plt
 
     def _frequency_extent_mhz(self) -> list[float]:
         half_span = self.config.sample_rate / 2.0
@@ -185,6 +259,9 @@ class WaterfallDisplay:
         ]
 
     def start(self, stop_event: threading.Event) -> None:
+        import numpy as np
+        from matplotlib.animation import FuncAnimation
+
         self.image = self.axis.imshow(
             self.waterfall,
             aspect="auto",
@@ -202,7 +279,7 @@ class WaterfallDisplay:
         self.axis.set_ylabel("Time (newest at top)")
         self.figure.colorbar(self.image, ax=self.axis, label="Power (dB)")
 
-        def update(_: int) -> list[AxesImage]:
+        def update(_: int) -> list["AxesImage"]:
             updated = False
             while True:
                 try:
@@ -228,7 +305,16 @@ class WaterfallDisplay:
             blit=False,
             cache_frame_data=False,
         )
-        plt.show()
+        self._plt.show()
+
+
+def missing_runtime_dependencies() -> list[str]:
+    """Return Python packages needed to run the live waterfall that are missing."""
+    return [
+        package
+        for package in ("numpy", "matplotlib")
+        if importlib.util.find_spec(package) is None
+    ]
 
 
 def parse_gain(value: str) -> str | float:
@@ -268,7 +354,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--read-size",
         type=int,
         default=16_384,
-        help="Samples read from the SDR at a time",
+        help="Complex samples read from rtl_sdr at a time",
     )
     parser.add_argument(
         "--buffer-blocks",
@@ -294,11 +380,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=20.0,
         help="Waterfall color scale maximum",
     )
+    parser.add_argument(
+        "--rtl-sdr-path",
+        default="rtl_sdr",
+        help="Path to the rtl_sdr executable used for sample capture",
+    )
     return parser
 
 
 def main() -> int:
     args = build_arg_parser().parse_args()
+    missing_packages = missing_runtime_dependencies()
+    if missing_packages:
+        print(
+            "Missing Python package(s): "
+            + ", ".join(missing_packages)
+            + ". Install them with: python3 -m pip install -r requirements.txt",
+            file=sys.stderr,
+        )
+        return 2
+
     config = RadioConfig(
         center_freq=args.center_freq,
         sample_rate=args.sample_rate,
@@ -308,22 +409,25 @@ def main() -> int:
         waterfall_rows=args.waterfall_rows,
         min_db=args.min_db,
         max_db=args.max_db,
+        rtl_sdr_path=args.rtl_sdr_path,
     )
 
     stop_event = threading.Event()
     sample_buffer = IQSampleBuffer(max_samples=args.fft_size * args.buffer_blocks)
-    spectra_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=args.waterfall_rows)
+    spectra_queue: "queue.Queue[np.ndarray[Any, Any]]" = queue.Queue(maxsize=args.waterfall_rows)
 
     def request_shutdown(signum: int, _: object) -> None:
         print(f"Received signal {signum}; shutting down...")
         stop_event.set()
+        reader.stop()
         sample_buffer.wake_all()
+
+    reader = SDRReaderThread(config, sample_buffer, stop_event)
+    processor = FFTProcessorThread(config, sample_buffer, spectra_queue, stop_event)
 
     signal.signal(signal.SIGINT, request_shutdown)
     signal.signal(signal.SIGTERM, request_shutdown)
 
-    reader = SDRReaderThread(config, sample_buffer, stop_event)
-    processor = FFTProcessorThread(config, sample_buffer, spectra_queue, stop_event)
     reader.start()
     processor.start()
 
@@ -331,6 +435,7 @@ def main() -> int:
         WaterfallDisplay(config, spectra_queue).start(stop_event)
     finally:
         stop_event.set()
+        reader.stop()
         sample_buffer.wake_all()
         reader.join(timeout=2.0)
         processor.join(timeout=2.0)
