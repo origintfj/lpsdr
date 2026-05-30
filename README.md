@@ -1,6 +1,6 @@
 # lpsdr
 
-A small Python RTL-SDR waterfall display skeleton.
+A small Python RTL-SDR waterfall display skeleton that reads samples through the standard `rtl_sdr` command-line program.
 
 ## Setup
 
@@ -10,8 +10,7 @@ Install the Python dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-The application expects an RTL-SDR device supported by `pyrtlsdr` and the
-underlying `librtlsdr` native library to be available on the host system.
+The application expects an RTL-SDR device and the `rtl_sdr` executable from the native `rtl-sdr` tools to be available on the host system. It intentionally does not use the `pyrtlsdr` Python bindings, avoiding version mismatches such as missing `librtlsdr` symbols.
 
 ## Run
 
@@ -28,11 +27,12 @@ Useful options:
 - `--fft-size`: samples used for each FFT waterfall row, default `2048`.
 - `--waterfall-rows`: displayed waterfall history rows, default `300`.
 - `--min-db` / `--max-db`: color scale bounds.
+- `--rtl-sdr-path`: executable used for capture, default `rtl_sdr`.
 
 ## Threading model
 
-- `SDRReaderThread` continuously reads complex I/Q samples from the RTL-SDR and
-  appends them to a thread-safe `IQSampleBuffer`.
+- `SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned 8-bit I/Q
+  bytes into complex samples, and appends them to a thread-safe `IQSampleBuffer`.
 - `FFTProcessorThread` waits until the buffer has at least one new FFT-sized
   block, computes a windowed FFT, and publishes power spectra to a queue.
 - The main thread owns the Matplotlib GUI and consumes spectra from the queue to
