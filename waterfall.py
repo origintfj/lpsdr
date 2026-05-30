@@ -193,7 +193,12 @@ class SDRReaderThread(threading.Thread):
         with self._process_lock:
             self._process = process
 
-        # rtl_sdr emits two unsigned bytes per complex sample: I, then Q.
+        # rtl_sdr emits two unsigned bytes per complex sample: I, then Q. For
+        # RTL-SDR dongles this is not a selectable output depth in this script;
+        # it reflects the native 8-bit sample format exposed by the RTL2832U
+        # hardware/rtl_sdr tool. Different SDR hardware may support wider ADCs,
+        # but this rtl_sdr-based reader is intentionally written for the common
+        # 8-bit RTL-SDR byte stream.
         bytes_per_read = self.config.read_size * 2
         while not self.stop_event.is_set():
             if process.stdout is None:
@@ -208,7 +213,9 @@ class SDRReaderThread(threading.Thread):
 
             # Convert [I0, Q0, I1, Q1, ...] from unsigned 8-bit integers into
             # complex64 samples centered near 0.0. The 127.5 midpoint maps the
-            # byte range 0..255 to approximately -1.0..+1.0.
+            # byte range 0..255 to approximately -1.0..+1.0; converting to
+            # float/complex64 makes the later FFT math convenient, but it does
+            # not add resolution beyond the original 8-bit measurements.
             interleaved = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
             normalized = (interleaved - 127.5) / 127.5
             iq_samples = normalized[0::2] + 1j * normalized[1::2]
