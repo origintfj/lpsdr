@@ -22,14 +22,13 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import queue
-import shutil
 import signal
-import subprocess
 import sys
 import threading
-from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
+
+from sdr_reader import IQSampleBuffer, SDRReaderThread
 
 if TYPE_CHECKING:
     # These imports are only needed by type checkers. Keeping the real runtime
@@ -61,167 +60,6 @@ class RadioConfig:
     rtl_sdr_path: str
 
 
-class IQSampleBuffer:
-    """Thread-safe buffer for complex I/Q samples from the SDR."""
-
-    def __init__(self, max_samples: int) -> None:
-        # The deque acts as a rolling capture buffer. Once it reaches maxlen,
-        # the oldest samples are discarded automatically so memory use stays
-        # bounded during long runs.
-        self._samples: deque[complex] = deque(maxlen=max_samples)
-        # The condition protects the deque and lets the processor sleep until
-        # the reader has appended enough fresh samples for another FFT.
-        self._condition = threading.Condition()
-
-    def append(self, samples: "np.ndarray[Any, Any]") -> None:
-        """Append a batch of complex samples and notify waiting consumers."""
-        import numpy as np
-
-        complex_samples = np.asarray(samples, dtype=np.complex64)
-        with self._condition:
-            self._samples.extend(complex_samples)
-            # Wake the FFT thread if it was blocked waiting for a full block.
-            self._condition.notify_all()
-
-    def wait_for_block(
-        self,
-        block_size: int,
-        stop_event: threading.Event,
-        timeout: float = 0.25,
-    ) -> Optional["np.ndarray[Any, Any]"]:
-        """Wait until enough new samples are available and return one FFT block.
-
-        Samples are consumed from the left side of the deque after they are
-        copied into the returned block. That makes the buffer behave like a
-        first-in/first-out queue: once the FFT thread receives a block, those
-        samples are no longer available for future FFTs.
-        """
-        import numpy as np
-
-        with self._condition:
-            while not stop_event.is_set():
-                if len(self._samples) >= block_size:
-                    # Copy and remove the oldest complete block while holding
-                    # the lock. The expensive FFT happens after the lock is
-                    # released, so the reader can keep appending samples.
-                    block = np.fromiter(
-                        (self._samples.popleft() for _ in range(block_size)),
-                        dtype=np.complex64,
-                        count=block_size,
-                    )
-                    return block
-                # Timed waits avoid hanging forever if shutdown happens between
-                # notifications or if the SDR process exits unexpectedly.
-                self._condition.wait(timeout=timeout)
-        return None
-
-    def wake_all(self) -> None:
-        """Wake consumers so they can notice shutdown."""
-        with self._condition:
-            self._condition.notify_all()
-
-
-class SDRReaderThread(threading.Thread):
-    """Continuously read samples from rtl_sdr into the I/Q buffer."""
-
-    def __init__(
-        self,
-        config: RadioConfig,
-        sample_buffer: IQSampleBuffer,
-        stop_event: threading.Event,
-    ) -> None:
-        super().__init__(name="sdr-reader", daemon=True)
-        self.config = config
-        self.sample_buffer = sample_buffer
-        self.stop_event = stop_event
-        self._process: subprocess.Popen[bytes] | None = None
-        self._process_lock = threading.Lock()
-
-    def run(self) -> None:
-        try:
-            self._read_from_rtl_sdr()
-        except Exception as exc:
-            # Any capture failure should stop the whole pipeline; otherwise the
-            # FFT and GUI threads would sit idle waiting for samples forever.
-            print(f"SDR reader stopped: {exc}", file=sys.stderr)
-            self.stop_event.set()
-        finally:
-            self.stop()
-            self.sample_buffer.wake_all()
-
-    def stop(self) -> None:
-        """Terminate the rtl_sdr child process, if it is still running."""
-        with self._process_lock:
-            process = self._process
-        if process is None or process.poll() is not None:
-            return
-        # Ask rtl_sdr to exit gracefully first. If it is blocked in a USB read,
-        # fall back to kill so the Python process can still shut down promptly.
-        process.terminate()
-        try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
-
-    def _read_from_rtl_sdr(self) -> None:
-        import numpy as np
-
-        rtl_sdr = shutil.which(self.config.rtl_sdr_path)
-        if rtl_sdr is None:
-            raise RuntimeError(
-                f"Could not find '{self.config.rtl_sdr_path}'. Install rtl-sdr "
-                "or pass --rtl-sdr-path with the full executable path."
-            )
-
-        # `rtl_sdr ... -` writes raw I/Q bytes to stdout. The frequency and
-        # sample-rate arguments are rounded because the CLI expects integer Hz.
-        command = [
-            rtl_sdr,
-            "-f",
-            str(round(self.config.center_freq)),
-            "-s",
-            str(round(self.config.sample_rate)),
-        ]
-        if not (isinstance(self.config.gain, str) and self.config.gain.lower() == "auto"):
-            command.extend(["-g", str(self.config.gain)])
-        command.append("-")
-
-        # Only stdout is piped. rtl_sdr's status messages remain on stderr so
-        # users can still see hardware errors and tuning messages in the shell.
-        process = subprocess.Popen(command, stdout=subprocess.PIPE)
-        with self._process_lock:
-            self._process = process
-
-        # rtl_sdr emits two unsigned bytes per complex sample: I, then Q. For
-        # RTL-SDR dongles this is not a selectable output depth in this script;
-        # it reflects the native 8-bit sample format exposed by the RTL2832U
-        # hardware/rtl_sdr tool. Different SDR hardware may support wider ADCs,
-        # but this rtl_sdr-based reader is intentionally written for the common
-        # 8-bit RTL-SDR byte stream.
-        bytes_per_read = self.config.read_size * 2
-        while not self.stop_event.is_set():
-            if process.stdout is None:
-                raise RuntimeError("rtl_sdr stdout pipe was not created")
-
-            raw = process.stdout.read(bytes_per_read)
-            if not raw:
-                exit_code = process.poll()
-                raise RuntimeError(f"rtl_sdr exited before samples were available: {exit_code}")
-            if len(raw) < bytes_per_read:
-                continue
-
-            # Convert [I0, Q0, I1, Q1, ...] from unsigned 8-bit integers into
-            # complex64 samples centered near 0.0. The 127.5 midpoint maps the
-            # byte range 0..255 to approximately -1.0..+1.0; converting to
-            # float/complex64 makes the later FFT math convenient, but it does
-            # not add resolution beyond the original 8-bit measurements.
-            interleaved = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
-            normalized = (interleaved - 127.5) / 127.5
-            iq_samples = normalized[0::2] + 1j * normalized[1::2]
-            self.sample_buffer.append(iq_samples)
-
-
 class FFTProcessorThread(threading.Thread):
     """Wait for new I/Q samples, compute spectra, and publish waterfall rows."""
 
@@ -247,7 +85,7 @@ class FFTProcessorThread(threading.Thread):
         import numpy as np
 
         while not self.stop_event.is_set():
-            block = self.sample_buffer.wait_for_block(
+            block = self.sample_buffer.wait_for_samples(
                 self.config.fft_size,
                 self.stop_event,
             )
@@ -480,9 +318,9 @@ def main() -> int:
         print(f"Received signal {signum}; shutting down...")
         stop_event.set()
         # Terminating the child process unblocks the reader if it is stuck in a
-        # blocking stdout read, while wake_all releases the processor condition.
+        # blocking stdout read, while wake_waiters releases the processor condition.
         reader.stop()
-        sample_buffer.wake_all()
+        sample_buffer.wake_waiters()
 
     reader = SDRReaderThread(config, sample_buffer, stop_event)
     processor = FFTProcessorThread(config, sample_buffer, spectra_queue, stop_event)
@@ -500,7 +338,7 @@ def main() -> int:
         # threads to stop and wait briefly so the rtl_sdr process is cleaned up.
         stop_event.set()
         reader.stop()
-        sample_buffer.wake_all()
+        sample_buffer.wake_waiters()
         reader.join(timeout=2.0)
         processor.join(timeout=2.0)
 
