@@ -72,9 +72,6 @@ class IQSampleBuffer:
         # The condition protects the deque and lets the processor sleep until
         # the reader has appended enough fresh samples for another FFT.
         self._condition = threading.Condition()
-        # Monotonic counter used to distinguish "new samples arrived" from
-        # "there are still old samples sitting in the rolling buffer".
-        self._total_written = 0
 
     def append(self, samples: "np.ndarray[Any, Any]") -> None:
         """Append a batch of complex samples and notify waiting consumers."""
@@ -83,39 +80,40 @@ class IQSampleBuffer:
         complex_samples = np.asarray(samples, dtype=np.complex64)
         with self._condition:
             self._samples.extend(complex_samples)
-            self._total_written += len(complex_samples)
             # Wake the FFT thread if it was blocked waiting for a full block.
             self._condition.notify_all()
 
     def wait_for_block(
         self,
         block_size: int,
-        last_total_seen: int,
         stop_event: threading.Event,
         timeout: float = 0.25,
-    ) -> tuple[Optional["np.ndarray[Any, Any]"], int]:
+    ) -> Optional["np.ndarray[Any, Any]"]:
         """Wait until enough new samples are available and return one FFT block.
 
-        The returned block is copied out of the shared buffer so processing can
-        happen without holding the condition lock. ``last_total_seen`` lets this
-        method wait for genuinely new samples rather than reprocessing the same
-        buffer contents repeatedly.
+        Samples are consumed from the left side of the deque after they are
+        copied into the returned block. That makes the buffer behave like a
+        first-in/first-out queue: once the FFT thread receives a block, those
+        samples are no longer available for future FFTs.
         """
         import numpy as np
 
         with self._condition:
             while not stop_event.is_set():
-                enough_samples = len(self._samples) >= block_size
-                enough_new_samples = self._total_written - last_total_seen >= block_size
-                if enough_samples and enough_new_samples:
-                    # Copy the newest block out while holding the lock, then let
-                    # the caller do the expensive FFT without blocking the reader.
-                    block = np.array(list(self._samples)[-block_size:], dtype=np.complex64)
-                    return block, self._total_written
+                if len(self._samples) >= block_size:
+                    # Copy and remove the oldest complete block while holding
+                    # the lock. The expensive FFT happens after the lock is
+                    # released, so the reader can keep appending samples.
+                    block = np.fromiter(
+                        (self._samples.popleft() for _ in range(block_size)),
+                        dtype=np.complex64,
+                        count=block_size,
+                    )
+                    return block
                 # Timed waits avoid hanging forever if shutdown happens between
                 # notifications or if the SDR process exits unexpectedly.
                 self._condition.wait(timeout=timeout)
-        return None, last_total_seen
+        return None
 
     def wake_all(self) -> None:
         """Wake consumers so they can notice shutdown."""
@@ -241,11 +239,9 @@ class FFTProcessorThread(threading.Thread):
     def run(self) -> None:
         import numpy as np
 
-        last_total_seen = 0
         while not self.stop_event.is_set():
-            block, last_total_seen = self.sample_buffer.wait_for_block(
+            block = self.sample_buffer.wait_for_block(
                 self.config.fft_size,
-                last_total_seen,
                 self.stop_event,
             )
             if block is None:
