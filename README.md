@@ -65,10 +65,10 @@ FFT, and display pipeline.
   bounded. Its `wait_for_samples(sample_count, stop_event)` method lets a
   processing thread block until exactly the requested number of fresh, previously
   unconsumed samples is available.
-- `SampleRouterThread` asks the capture buffer for `--display-update-samples`
-  fresh samples per pass and appends that block to independent
-  `sdr_reader.IQSampleBuffer` instances for waterfall generation and the
-  time-domain I/Q graph. Waterfall FFT rows are still computed from
+- `processing_thread.ProcessingThread` asks the capture buffer for
+  `--display-update-samples` fresh samples per pass and appends that block to
+  independent `sdr_reader.IQSampleBuffer` instances for waterfall generation and
+  the time-domain I/Q graph. Waterfall FFT rows are still computed from
   `--fft-size` accumulated samples, so GUI handoff granularity is independent
   of the waterfall block size. This mirrors the intended processing-thread
   handoff model: downstream code can choose whether to append a block for the
@@ -87,7 +87,7 @@ FFT, and display pipeline.
   blocks and writes them to the configured `sounddevice` output at the audio
   sample rate chosen during initialization. The audio queue is bounded by
   `--audio-buffer-seconds` so speaker latency and memory use stay bounded.
-- The main thread owns the Matplotlib GUI, drains the waterfall buffer to
-  compute FFT rows, and drains the time-domain buffer into the plot's rolling
-  view so the I/Q graph always shows the last `--time-domain-samples` samples
-  retained for that display.
+- The main thread owns `waterfall.RadioGui`, the Matplotlib GUI facade. It
+  drains the waterfall buffer to compute FFT rows and drains the time-domain
+  buffer into the plot's rolling view so the I/Q graph always shows the last
+  `--time-domain-samples` samples retained for that display.

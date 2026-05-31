@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 from audio_output import AudioPlaybackThread, AudioSampleQueue
+from processing_thread import ProcessingThread
 from sdr_reader import IQSampleBuffer, SDRReaderThread
 
 if TYPE_CHECKING:
@@ -68,65 +69,7 @@ class RadioConfig:
     rtl_sdr_path: str
 
 
-class SampleRouterThread(threading.Thread):
-    """Wait for new I/Q samples and publish them to display/audio buffers."""
-
-    def __init__(
-        self,
-        config: RadioConfig,
-        sample_buffer: IQSampleBuffer,
-        waterfall_queue: IQSampleBuffer | None,
-        time_domain_queue: IQSampleBuffer | None,
-        stop_event: threading.Event,
-        audio_queue: AudioSampleQueue | None = None,
-        audio_sample_rate: int | None = None,
-        audio_gain: float = 0.2,
-    ) -> None:
-        super().__init__(name="sample-router", daemon=True)
-        self.config = config
-        self.sample_buffer = sample_buffer
-        self.waterfall_queue = waterfall_queue
-        self.time_domain_queue = time_domain_queue
-        self.stop_event = stop_event
-        self.audio_queue = audio_queue
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_gain = audio_gain
-
-    def run(self) -> None:
-        while not self.stop_event.is_set():
-            block = self.sample_buffer.wait_for_samples(
-                self.config.display_update_sample_count,
-                self.stop_event,
-            )
-            if block is None:
-                continue
-
-            # These are intentionally independent handoff points. A processing
-            # stage can choose to push different blocks into each display, while
-            # the sample rate represented by both remains the SDR sample rate.
-            if self.waterfall_queue is not None:
-                self.waterfall_queue.append(block)
-            if self.time_domain_queue is not None:
-                self.time_domain_queue.append(block)
-            self._push_audio_samples(block)
-
-    def _push_audio_samples(self, block: "np.ndarray[Any, Any]") -> None:
-        """Push a simple downsampled monitor stream to the audio queue, if enabled."""
-        import numpy as np
-
-        if self.audio_queue is None or self.audio_sample_rate is None:
-            return
-
-        # This is a lightweight audio monitor path rather than a full AM/FM/SSB
-        # demodulator. It lets downstream code hear a bounded, real-valued view
-        # of processed samples while keeping playback rate independent of SDR
-        # sample rate.
-        decimation = max(1, round(self.config.sample_rate / self.audio_sample_rate))
-        audio_samples = np.real(block[::decimation]).astype(np.float32)
-        self.audio_queue.push_samples(audio_samples * self.audio_gain)
-
-
-class WaterfallDisplay:
+class RadioGui:
     """Matplotlib GUI for time-domain I/Q and waterfall displays."""
 
     def __init__(
@@ -542,7 +485,7 @@ def main() -> int:
             audio_queue.wake_waiters()
 
     reader = SDRReaderThread(config, sample_buffer, stop_event)
-    processor = SampleRouterThread(
+    processor = ProcessingThread(
         config,
         sample_buffer,
         waterfall_queue,
@@ -562,7 +505,7 @@ def main() -> int:
         audio_thread.start()
 
     try:
-        WaterfallDisplay(config, waterfall_queue, time_domain_queue).start(stop_event)
+        RadioGui(config, waterfall_queue, time_domain_queue).start(stop_event)
     finally:
         # The GUI runs on the main thread. When it exits, always ask the worker
         # threads to stop and wait briefly so the rtl_sdr process is cleaned up.
