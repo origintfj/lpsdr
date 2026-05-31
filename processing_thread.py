@@ -25,8 +25,6 @@ class ProcessingThread(threading.Thread):
         time_domain_queue: IQSampleBuffer | None,
         stop_event: threading.Event,
         audio_queue: AudioSampleQueue | None = None,
-        audio_sample_rate: int | None = None,
-        audio_gain: float = 0.2,
     ) -> None:
         super().__init__(name="processing", daemon=True)
         self.config = config
@@ -35,8 +33,6 @@ class ProcessingThread(threading.Thread):
         self.time_domain_queue = time_domain_queue
         self.stop_event = stop_event
         self.audio_queue = audio_queue
-        self.audio_sample_rate = audio_sample_rate
-        self.audio_gain = audio_gain
 
     def run(self) -> None:
         while not self.stop_event.is_set():
@@ -57,17 +53,12 @@ class ProcessingThread(threading.Thread):
             self._push_audio_samples(block)
 
     def _push_audio_samples(self, block: "np.ndarray[Any, Any]") -> None:
-        """Push a simple downsampled monitor stream to the audio queue, if enabled."""
+        """Push the real part of each processed sample to the audio queue."""
         import numpy as np
 
-        if self.audio_queue is None or self.audio_sample_rate is None:
+        if self.audio_queue is None:
             return
 
-        # This is a lightweight audio monitor path rather than a full AM/FM/SSB
-        # demodulator. It lets downstream code hear a bounded, real-valued view
-        # of processed samples while keeping playback rate independent of SDR
-        # sample rate.
-        decimation = max(1, round(self.config.sample_rate / self.audio_sample_rate))
-        audio_samples = np.real(block[::decimation]).astype(np.float32)
-        self.audio_queue.push_samples(audio_samples * self.audio_gain)
+        audio_samples = np.real(block).astype(np.float32)
+        self.audio_queue.push_samples(audio_samples)
 
