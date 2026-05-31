@@ -37,8 +37,6 @@ Useful options:
 - `--audio-block-size`: audio samples written to the sound device per block,
   default `1024`.
 - `--audio-buffer-seconds`: maximum queued audio backlog, default `0.5`.
-- `--audio-gain`: linear gain applied before queuing audio samples, default
-  `0.2`.
 - `--audio-device`: optional `sounddevice` output device name or index.
 
 ## I/Q sample resolution
@@ -85,8 +83,11 @@ FFT, and display pipeline.
   rolling view of exactly that many most-recent samples.
 - `audio_output.AudioPlaybackThread` drains `AudioSampleQueue` in fixed-size
   blocks and writes them to the configured `sounddevice` output at the audio
-  sample rate chosen during initialization. The audio queue is bounded by
-  `--audio-buffer-seconds` so speaker latency and memory use stay bounded.
+  sample rate chosen during initialization. The processing thread pushes the real
+  part of each processed sample block directly into this queue. The audio queue
+  is bounded by `--audio-buffer-seconds` so speaker latency and memory use stay
+  bounded; if producers append more samples than fit, the oldest queued samples
+  are discarded first.
 - The main thread owns `waterfall.RadioGui`, the Matplotlib GUI facade. It
   drains the waterfall buffer to compute FFT rows and drains the time-domain
   buffer into the plot's rolling view so the I/Q graph always shows the last

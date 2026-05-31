@@ -386,12 +386,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Maximum queued audio backlog in seconds",
     )
     parser.add_argument(
-        "--audio-gain",
-        type=float,
-        default=0.2,
-        help="Linear gain applied before samples are queued for audio playback",
-    )
-    parser.add_argument(
         "--audio-device",
         default=None,
         help="Optional sounddevice output device name or index",
@@ -492,8 +486,6 @@ def main() -> int:
         time_domain_queue,
         stop_event,
         audio_queue=audio_queue,
-        audio_sample_rate=args.audio_sample_rate if args.enable_audio else None,
-        audio_gain=args.audio_gain,
     )
 
     signal.signal(signal.SIGINT, request_shutdown)
