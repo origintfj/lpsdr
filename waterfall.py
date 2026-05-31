@@ -15,12 +15,13 @@ Dependencies:
     pip install numpy matplotlib
 
 Example:
-    python3 waterfall.py --center-freq 100.1e6 --sample-rate 2.4e6 --gain auto
+    python3 waterfall.py --center-freq 100.1e6 --bb-sample-rate 2400000 --gain auto
 """
 
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import importlib.util
 import signal
 import sys
@@ -48,7 +49,8 @@ class RadioConfig:
     # Frequencies and rates are stored in Hz so the values can be passed to the
     # rtl_sdr command without unit conversion surprises.
     center_freq: float
-    sample_rate: float
+    # Baseband sample rate from the SDR, distinct from audio playback sample rate.
+    bb_sample_rate: int
     gain: str | float
     # One FFT is computed from this many complex I/Q samples. Larger values give
     # better frequency resolution but update the waterfall more slowly.
@@ -112,8 +114,8 @@ class RadioGui:
     def _frequency_extent_mhz(self) -> list[float]:
         # Matplotlib uses this extent to label the x-axis in actual RF frequency
         # rather than FFT-bin number. With complex I/Q data, the visible span is
-        # roughly center_freq +/- sample_rate/2.
-        half_span = self.config.sample_rate / 2.0
+        # roughly center_freq +/- bb_sample_rate/2.
+        half_span = self.config.bb_sample_rate / 2.0
         return [
             (self.config.center_freq - half_span) / 1e6,
             (self.config.center_freq + half_span) / 1e6,
@@ -126,7 +128,7 @@ class RadioGui:
 
         return (
             np.arange(self.config.iq_display_sample_count, dtype=np.float32)
-            / self.config.sample_rate
+            / self.config.bb_sample_rate
             * 1_000.0
         )
 
@@ -272,6 +274,18 @@ def parse_gain(value: str) -> str | float:
     return float(value)
 
 
+def parse_integer_hz(value: str) -> int:
+    """Parse a frequency/rate argument as an integer number of Hz."""
+    try:
+        parsed = Decimal(value)
+    except InvalidOperation as exc:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid number") from exc
+
+    if not parsed.is_finite() or parsed != parsed.to_integral_value():
+        raise argparse.ArgumentTypeError(f"{value!r} is not an integer number of Hz")
+    return int(parsed)
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Threaded RTL-SDR waterfall and time-domain display skeleton"
@@ -283,10 +297,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Center frequency in Hz, e.g. 100.1e6",
     )
     parser.add_argument(
+        "--bb-sample-rate",
+        dest="bb_sample_rate",
+        type=parse_integer_hz,
+        default=2_400_000,
+        help="RTL-SDR baseband sample rate in samples/sec",
+    )
+    parser.add_argument(
         "--sample-rate",
-        type=float,
-        default=2.4e6,
-        help="RTL-SDR sample rate in samples/sec",
+        dest="bb_sample_rate",
+        type=parse_integer_hz,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--gain",
@@ -405,6 +426,9 @@ def main() -> int:
         )
         return 2
 
+    if args.bb_sample_rate <= 0:
+        print("--bb-sample-rate must be greater than zero", file=sys.stderr)
+        return 2
     if args.fft_size <= 0:
         print("--fft-size must be greater than zero", file=sys.stderr)
         return 2
@@ -430,7 +454,7 @@ def main() -> int:
 
     config = RadioConfig(
         center_freq=args.center_freq,
-        sample_rate=args.sample_rate,
+        bb_sample_rate=args.bb_sample_rate,
         gain=args.gain,
         fft_size=args.fft_size,
         iq_display_sample_count=args.iq_display_sample_count,

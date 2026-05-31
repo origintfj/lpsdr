@@ -25,7 +25,7 @@ class SDRReaderConfig(Protocol):
     """Configuration attributes required by ``SDRReaderThread``."""
 
     center_freq: float
-    sample_rate: float
+    bb_sample_rate: int
     gain: str | float
     read_size: int
     rtl_sdr_path: str
@@ -178,14 +178,15 @@ class SDRReaderThread(threading.Thread):
                 "or pass --rtl-sdr-path with the full executable path."
             )
 
-        # `rtl_sdr ... -` writes raw I/Q bytes to stdout. The frequency and
-        # sample-rate arguments are rounded because the CLI expects integer Hz.
+        # `rtl_sdr ... -` writes raw I/Q bytes to stdout. The center frequency is
+        # rounded because the CLI expects integer Hz; the baseband sample rate is
+        # already parsed as an integer.
         command = [
             rtl_sdr,
             "-f",
             str(round(self.config.center_freq)),
             "-s",
-            str(round(self.config.sample_rate)),
+            str(self.config.bb_sample_rate),
         ]
         gain_is_auto = (
             isinstance(self.config.gain, str)
