@@ -70,12 +70,13 @@ class RadioConfig:
 
 
 class IQDisplaySampleQueue:
-    """Bounded queue of complex I/Q sample blocks for GUI displays.
+    """Bounded queue of complex I/Q sample blocks for waterfall generation.
 
     Producers call :meth:`push_samples` with an arbitrary-sized NumPy-compatible
     complex sample batch. The GUI thread calls :meth:`drain_available` to take
     ownership of any queued blocks without blocking. If the queue fills, oldest
-    blocks are dropped so live displays prefer recent samples over stale backlog.
+    blocks are dropped so the live waterfall prefers recent samples over stale
+    backlog.
     """
 
     def __init__(self, max_blocks: int) -> None:
@@ -118,6 +119,93 @@ class IQDisplaySampleQueue:
                 return blocks
 
 
+class IQDisplaySampleHistory:
+    """Thread-safe rolling history for the time-domain I/Q display.
+
+    Unlike ``IQDisplaySampleQueue``, this class is bounded by the number of
+    samples the time-domain graph is configured to show, not by the number or
+    size of producer blocks. Producers may push any positive number of fresh
+    samples, and the GUI can always read the most recent ``max_samples`` values
+    retained specifically for the I/Q plot.
+    """
+
+    def __init__(self, max_samples: int) -> None:
+        import numpy as np
+
+        if max_samples <= 0:
+            raise ValueError("max_samples must be greater than zero")
+        self._samples = np.zeros(max_samples, dtype=np.complex64)
+        self._write_index = 0
+        self._filled_samples = 0
+        self._lock = threading.Lock()
+        self._has_update = False
+
+    @property
+    def max_samples(self) -> int:
+        """Number of complex I/Q samples retained for display."""
+        return int(self._samples.size)
+
+    def push_samples(self, samples: "np.ndarray[Any, Any]") -> None:
+        """Append samples and retain only the most recent display window."""
+        import numpy as np
+
+        iq_samples = np.asarray(samples, dtype=np.complex64).reshape(-1)
+        if iq_samples.size == 0:
+            return
+
+        with self._lock:
+            if iq_samples.size >= self.max_samples:
+                self._samples[:] = iq_samples[-self.max_samples :]
+                self._write_index = 0
+                self._filled_samples = self.max_samples
+                self._has_update = True
+                return
+
+            first_chunk = min(
+                iq_samples.size,
+                self.max_samples - self._write_index,
+            )
+            self._samples[self._write_index : self._write_index + first_chunk] = (
+                iq_samples[:first_chunk]
+            )
+            remaining = iq_samples.size - first_chunk
+            if remaining:
+                self._samples[:remaining] = iq_samples[first_chunk:]
+
+            self._write_index = (
+                self._write_index + iq_samples.size
+            ) % self.max_samples
+            self._filled_samples = min(
+                self.max_samples,
+                self._filled_samples + iq_samples.size,
+            )
+            self._has_update = True
+
+    def drain_available(self) -> "np.ndarray[Any, Any] | None":
+        """Return the latest display history once for each producer update."""
+        import numpy as np
+
+        with self._lock:
+            if not self._has_update:
+                return None
+            self._has_update = False
+
+            start = (self._write_index - self._filled_samples) % self.max_samples
+            if start + self._filled_samples <= self.max_samples:
+                history = self._samples[start : start + self._filled_samples].copy()
+            else:
+                history = np.concatenate(
+                    [self._samples[start:], self._samples[: self._write_index]],
+                )
+
+            if history.size == self.max_samples:
+                return history
+
+            display_samples = np.zeros(self.max_samples, dtype=np.complex64)
+            display_samples[-history.size :] = history
+            return display_samples
+
+
 class SampleRouterThread(threading.Thread):
     """Wait for new I/Q samples and publish them to display/audio queues."""
 
@@ -126,7 +214,7 @@ class SampleRouterThread(threading.Thread):
         config: RadioConfig,
         sample_buffer: IQSampleBuffer,
         waterfall_queue: IQDisplaySampleQueue | None,
-        time_domain_queue: IQDisplaySampleQueue | None,
+        time_domain_queue: IQDisplaySampleHistory | None,
         stop_event: threading.Event,
         audio_queue: AudioSampleQueue | None = None,
         audio_sample_rate: int | None = None,
@@ -151,9 +239,9 @@ class SampleRouterThread(threading.Thread):
             if block is None:
                 continue
 
-            # These are intentionally independent queues. A processing stage can
-            # choose to push different blocks into each display, while the sample
-            # rate represented by both queues remains the SDR sample rate.
+            # These are intentionally independent handoff points. A processing
+            # stage can choose to push different blocks into each display, while
+            # the sample rate represented by both remains the SDR sample rate.
             if self.waterfall_queue is not None:
                 self.waterfall_queue.push_samples(block)
             if self.time_domain_queue is not None:
@@ -183,7 +271,7 @@ class WaterfallDisplay:
         self,
         config: RadioConfig,
         waterfall_queue: IQDisplaySampleQueue,
-        time_domain_queue: IQDisplaySampleQueue,
+        time_domain_queue: IQDisplaySampleHistory,
     ) -> None:
         import matplotlib.pyplot as plt
         import numpy as np
@@ -308,17 +396,11 @@ class WaterfallDisplay:
         self._plt.show()
 
     def _update_time_domain(self) -> bool:
-        import numpy as np
-
-        blocks = self.time_domain_queue.drain_available()
-        if not blocks:
+        samples = self.time_domain_queue.drain_available()
+        if samples is None:
             return False
 
-        samples = np.concatenate([self._time_domain, *blocks]).astype(
-            np.complex64,
-            copy=False,
-        )
-        self._time_domain = samples[-self.config.iq_display_sample_count :]
+        self._time_domain = samples
 
         if self.i_line is not None and self.q_line is not None:
             self.i_line.set_ydata(self._time_domain.real)
@@ -419,7 +501,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         type=int,
         default=1024,
         help=(
-            "Fresh I/Q samples routed to GUI display queues per processing pass; "
+            "Fresh I/Q samples routed to GUI display handoff points per "
+            "processing pass; "
             "independent of --fft-size"
         ),
     )
@@ -439,7 +522,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--display-queue-blocks",
         type=int,
         default=8,
-        help="Maximum queued sample blocks retained per GUI display",
+        help="Maximum queued sample blocks retained for waterfall generation",
     )
     parser.add_argument(
         "--waterfall-rows",
@@ -551,12 +634,14 @@ def main() -> int:
     )
 
     stop_event = threading.Event()
-    # The sample buffer bridges the reader and processing thread. The two GUI
-    # queues are independent handoff points: processing code can push one sample
-    # block stream for waterfall FFTs and another stream for the time-domain plot.
+    # The sample buffer bridges the reader and processing thread. The waterfall
+    # queue is bounded by blocks for FFT generation, while the time-domain
+    # history is bounded only by the configured number of samples to display.
     sample_buffer = IQSampleBuffer(max_samples=max_buffer_samples)
     waterfall_queue = IQDisplaySampleQueue(max_blocks=args.display_queue_blocks)
-    time_domain_queue = IQDisplaySampleQueue(max_blocks=args.display_queue_blocks)
+    time_domain_queue = IQDisplaySampleHistory(
+        max_samples=args.iq_display_sample_count,
+    )
     audio_queue: AudioSampleQueue | None = None
     audio_thread: AudioPlaybackThread | None = None
     if args.enable_audio:

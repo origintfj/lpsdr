@@ -26,8 +26,8 @@ Useful options:
 - `--gain`: tuner gain in dB or `auto`, default `auto`.
 - `--fft-size`: samples used for each FFT waterfall row, default `2048`.
 - `--time-domain-samples` / `--iq-display-samples`: most recent I/Q samples shown in the time-domain graph above the waterfall, default `2048`.
-- `--display-update-samples`: fresh I/Q samples routed to GUI display queues per processing pass, independent of `--fft-size`, default `1024`.
-- `--display-queue-blocks`: maximum queued sample blocks retained for each GUI display, default `8`.
+- `--display-update-samples`: fresh I/Q samples routed to GUI display handoff points per processing pass, independent of `--fft-size`, default `1024`.
+- `--display-queue-blocks`: maximum queued sample blocks retained for waterfall generation, default `8`. The time-domain I/Q history is sized only by `--time-domain-samples` / `--iq-display-samples`.
 - `--waterfall-rows`: displayed waterfall history rows, default `300`.
 - `--min-db` / `--max-db`: color scale bounds.
 - `--rtl-sdr-path`: executable used for capture, default `rtl_sdr`.
@@ -66,24 +66,25 @@ FFT, and display pipeline.
   processing thread block until exactly the requested number of fresh, previously
   unconsumed samples is available.
 - `SampleRouterThread` asks the buffer for `--display-update-samples` fresh
-  samples per pass and pushes that block into two independent GUI queues: one
-  for waterfall generation and one for the time-domain I/Q graph. Waterfall FFT
-  rows are still computed from `--fft-size` accumulated samples, so GUI handoff
-  granularity is independent of the waterfall block size. This mirrors the
-  intended processing-thread handoff model: downstream code can choose whether
-  to enqueue a block for the waterfall display, the time-domain display, both
-  displays, or neither.
-- Both GUI queues carry samples at the SDR sample rate configured by
-  `--sample-rate`. They are separate queues, so they do not have to contain the
+  samples per pass and pushes that block into independent GUI handoff points:
+  a block queue for waterfall generation and a rolling sample history for the
+  time-domain I/Q graph. Waterfall FFT rows are still computed from
+  `--fft-size` accumulated samples, so GUI handoff granularity is independent
+  of the waterfall block size. This mirrors the intended processing-thread
+  handoff model: downstream code can choose whether to enqueue a block for the
+  waterfall display, the time-domain display, both displays, or neither.
+- Both GUI handoff paths carry samples at the SDR sample rate configured by
+  `--sample-rate`. They are separate paths, so they do not have to contain the
   same sample blocks even though their x-axes use the same sample-rate basis.
 - `waterfall.IQDisplaySampleQueue` is bounded by `--display-queue-blocks` and
-  drops oldest blocks if the GUI falls behind, keeping the live plots recent and
-  memory use bounded.
+  drops oldest waterfall blocks if the GUI falls behind, keeping waterfall
+  generation recent and memory use bounded. `waterfall.IQDisplaySampleHistory`
+  is bounded independently by `--time-domain-samples` / `--iq-display-samples`
+  and keeps exactly that many most-recent samples for the I/Q plot.
 - `audio_output.AudioPlaybackThread` drains `AudioSampleQueue` in fixed-size
   blocks and writes them to the configured `sounddevice` output at the audio
   sample rate chosen during initialization. The audio queue is bounded by
   `--audio-buffer-seconds` so speaker latency and memory use stay bounded.
 - The main thread owns the Matplotlib GUI, drains the waterfall queue to compute
-  FFT rows, and drains the time-domain queue into a rolling display buffer so
-  the I/Q graph always shows the last `--time-domain-samples` samples available
-  to the display.
+  FFT rows, and reads the time-domain sample history so the I/Q graph always
+  shows the last `--time-domain-samples` samples retained for that display.
