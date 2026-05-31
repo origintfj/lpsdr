@@ -1,0 +1,68 @@
+# Comprehensive lpsdr YAML configuration template.
+#
+# Run with:
+#   python3 waterfall.py --config radio_config.yaml
+#
+# Command-line options can still be supplied and override values from this file,
+# for example:
+#   python3 waterfall.py --config radio_config.yaml --center-freq 100.1e6
+
+radio:
+  # Required: RF center frequency in Hz. Scientific notation may be quoted for
+  # maximum YAML parser compatibility.
+  center_freq: "100.1e6"
+
+  # RTL-SDR baseband sample rate in complex I/Q samples per second.
+  bb_sample_rate: 2400000
+
+  # Tuner gain in dB, or "auto" for automatic tuner gain.
+  gain: auto
+
+  # Complex I/Q samples read from rtl_sdr per stdout read.
+  read_size: 16384
+
+  # Name or full path of the native rtl_sdr executable.
+  rtl_sdr_path: rtl_sdr
+
+processing:
+  # Complex samples used for each FFT waterfall row. Larger values improve
+  # frequency resolution but slow the visual update rate.
+  fft_size: 2048
+
+  # Number of FFT-sized blocks retained in the bounded capture buffer.
+  buffer_blocks: 32
+
+  # Fresh I/Q samples routed to GUI display handoff points per processing pass.
+  # This can be smaller than fft_size so GUI handoff granularity is independent
+  # of waterfall FFT size.
+  display_update_samples: 1024
+
+display:
+  # Most recent complex I/Q samples shown in the time-domain graph.
+  time_domain_samples: 2048
+
+  # Waterfall display buffer capacity measured in display_update_samples blocks.
+  display_queue_blocks: 8
+
+  # Number of rows retained in the waterfall history image.
+  waterfall_rows: 300
+
+  # Waterfall color scale bounds in relative dB.
+  min_db: -80.0
+  max_db: 20.0
+
+audio:
+  # Enable a simple mono audio monitor from processed sample real values.
+  enable: false
+
+  # Speaker playback rate in samples per second.
+  sample_rate: 48000
+
+  # Audio samples written to the sound device per block.
+  block_size: 1024
+
+  # Maximum queued audio backlog in seconds.
+  buffer_seconds: 0.5
+
+  # Optional sounddevice output device name or index. Use null for default.
+  device: null
