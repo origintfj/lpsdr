@@ -4,7 +4,8 @@ The classes in this module form the producer side of the waterfall pipeline:
 ``SDRReaderThread`` reads raw bytes from the ``rtl_sdr`` command-line tool,
 converts them to complex I/Q samples, and appends them to ``IQSampleBuffer``.
 Consumers can then make one blocking call that states exactly how many fresh
-samples they need before processing can continue.
+samples they need before processing can continue, or drain whatever samples are
+currently available for non-blocking display updates.
 """
 
 from __future__ import annotations
@@ -33,10 +34,11 @@ class SDRReaderConfig(Protocol):
 class IQSampleBuffer:
     """Thread-safe bounded FIFO buffer for complex I/Q samples.
 
-    ``max_samples`` fixes the largest backlog retained by the buffer. If the
-    SDR reader produces samples faster than the consumer can process them, the
-    oldest unconsumed samples are discarded by the underlying rolling deque so
-    memory usage stays bounded.
+    ``max_samples`` fixes the largest backlog retained by the buffer. If a
+    producer appends samples faster than a consumer drains them, the oldest
+    unconsumed samples are discarded by the underlying rolling deque so memory
+    usage stays bounded. The same buffer type is used for the capture handoff,
+    waterfall handoff, and time-domain display handoff.
     """
 
     def __init__(self, max_samples: int) -> None:
@@ -56,7 +58,10 @@ class IQSampleBuffer:
         """Append a batch of complex samples and notify waiting consumers."""
         import numpy as np
 
-        complex_samples = np.asarray(samples, dtype=np.complex64)
+        complex_samples = np.asarray(samples, dtype=np.complex64).reshape(-1)
+        if complex_samples.size == 0:
+            return
+
         with self._condition:
             self._samples.extend(complex_samples)
             self._condition.notify_all()
@@ -94,6 +99,25 @@ class IQSampleBuffer:
                     )
                 self._condition.wait(timeout=timeout)
         return None
+
+    def drain_available(self) -> "np.ndarray[Any, Any] | None":
+        """Return and consume all samples currently retained, if any.
+
+        This method is intentionally non-blocking for GUI update paths. If the
+        buffer has overflowed since the previous drain, the returned array
+        contains the newest samples still retained by ``max_samples``.
+        """
+        import numpy as np
+
+        with self._condition:
+            sample_count = len(self._samples)
+            if sample_count == 0:
+                return None
+            return np.fromiter(
+                (self._samples.popleft() for _ in range(sample_count)),
+                dtype=np.complex64,
+                count=sample_count,
+            )
 
     def wake_waiters(self) -> None:
         """Wake blocked consumers so they can notice shutdown."""

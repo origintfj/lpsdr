@@ -27,7 +27,7 @@ Useful options:
 - `--fft-size`: samples used for each FFT waterfall row, default `2048`.
 - `--time-domain-samples` / `--iq-display-samples`: most recent I/Q samples shown in the time-domain graph above the waterfall, default `2048`.
 - `--display-update-samples`: fresh I/Q samples routed to GUI display handoff points per processing pass, independent of `--fft-size`, default `1024`.
-- `--display-queue-blocks`: maximum queued sample blocks retained for waterfall generation, default `8`. The time-domain I/Q history is sized only by `--time-domain-samples` / `--iq-display-samples`.
+- `--display-queue-blocks`: waterfall display buffer capacity measured in `--display-update-samples` blocks, default `8`. The time-domain I/Q buffer is sized only by `--time-domain-samples` / `--iq-display-samples`.
 - `--waterfall-rows`: displayed waterfall history rows, default `300`.
 - `--min-db` / `--max-db`: color scale bounds.
 - `--rtl-sdr-path`: executable used for capture, default `rtl_sdr`.
@@ -65,26 +65,29 @@ FFT, and display pipeline.
   bounded. Its `wait_for_samples(sample_count, stop_event)` method lets a
   processing thread block until exactly the requested number of fresh, previously
   unconsumed samples is available.
-- `SampleRouterThread` asks the buffer for `--display-update-samples` fresh
-  samples per pass and pushes that block into independent GUI handoff points:
-  a block queue for waterfall generation and a rolling sample history for the
+- `SampleRouterThread` asks the capture buffer for `--display-update-samples`
+  fresh samples per pass and appends that block to independent
+  `sdr_reader.IQSampleBuffer` instances for waterfall generation and the
   time-domain I/Q graph. Waterfall FFT rows are still computed from
   `--fft-size` accumulated samples, so GUI handoff granularity is independent
   of the waterfall block size. This mirrors the intended processing-thread
-  handoff model: downstream code can choose whether to enqueue a block for the
+  handoff model: downstream code can choose whether to append a block for the
   waterfall display, the time-domain display, both displays, or neither.
 - Both GUI handoff paths carry samples at the SDR sample rate configured by
-  `--sample-rate`. They are separate paths, so they do not have to contain the
-  same sample blocks even though their x-axes use the same sample-rate basis.
-- `waterfall.IQDisplaySampleQueue` is bounded by `--display-queue-blocks` and
-  drops oldest waterfall blocks if the GUI falls behind, keeping waterfall
-  generation recent and memory use bounded. `waterfall.IQDisplaySampleHistory`
-  is bounded independently by `--time-domain-samples` / `--iq-display-samples`
-  and keeps exactly that many most-recent samples for the I/Q plot.
+  `--sample-rate`. They are separate `IQSampleBuffer` instances, so they do not
+  have to contain the same sample blocks even though their x-axes use the same
+  sample-rate basis.
+- The waterfall `IQSampleBuffer` is sized to
+  `--display-update-samples * --display-queue-blocks` and drops oldest samples
+  if the GUI falls behind, keeping waterfall generation recent and memory use
+  bounded. The time-domain `IQSampleBuffer` is bounded independently by
+  `--time-domain-samples` / `--iq-display-samples`; the plot keeps its own
+  rolling view of exactly that many most-recent samples.
 - `audio_output.AudioPlaybackThread` drains `AudioSampleQueue` in fixed-size
   blocks and writes them to the configured `sounddevice` output at the audio
   sample rate chosen during initialization. The audio queue is bounded by
   `--audio-buffer-seconds` so speaker latency and memory use stay bounded.
-- The main thread owns the Matplotlib GUI, drains the waterfall queue to compute
-  FFT rows, and reads the time-domain sample history so the I/Q graph always
-  shows the last `--time-domain-samples` samples retained for that display.
+- The main thread owns the Matplotlib GUI, drains the waterfall buffer to
+  compute FFT rows, and drains the time-domain buffer into the plot's rolling
+  view so the I/Q graph always shows the last `--time-domain-samples` samples
+  retained for that display.
