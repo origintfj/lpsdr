@@ -25,7 +25,8 @@ Useful options:
 - `--sample-rate`: sample rate in samples/sec, default `2.4e6`.
 - `--gain`: tuner gain in dB or `auto`, default `auto`.
 - `--fft-size`: samples used for each FFT waterfall row, default `2048`.
-- `--time-domain-samples`: I/Q samples shown in the time-domain graph above the waterfall, default `2048`.
+- `--time-domain-samples` / `--iq-display-samples`: most recent I/Q samples shown in the time-domain graph above the waterfall, default `2048`.
+- `--display-update-samples`: fresh I/Q samples routed to GUI display queues per processing pass, independent of `--fft-size`, default `1024`.
 - `--display-queue-blocks`: maximum queued sample blocks retained for each GUI display, default `8`.
 - `--waterfall-rows`: displayed waterfall history rows, default `300`.
 - `--min-db` / `--max-db`: color scale bounds.
@@ -64,11 +65,14 @@ FFT, and display pipeline.
   bounded. Its `wait_for_samples(sample_count, stop_event)` method lets a
   processing thread block until exactly the requested number of fresh, previously
   unconsumed samples is available.
-- `SampleRouterThread` asks the buffer for one FFT-sized sample block and pushes
-  that block into two independent GUI queues: one for waterfall generation and
-  one for the time-domain I/Q graph. This mirrors the intended processing-thread
-  handoff model: downstream code can choose whether to enqueue a block for the
-  waterfall display, the time-domain display, both displays, or neither.
+- `SampleRouterThread` asks the buffer for `--display-update-samples` fresh
+  samples per pass and pushes that block into two independent GUI queues: one
+  for waterfall generation and one for the time-domain I/Q graph. Waterfall FFT
+  rows are still computed from `--fft-size` accumulated samples, so GUI handoff
+  granularity is independent of the waterfall block size. This mirrors the
+  intended processing-thread handoff model: downstream code can choose whether
+  to enqueue a block for the waterfall display, the time-domain display, both
+  displays, or neither.
 - Both GUI queues carry samples at the SDR sample rate configured by
   `--sample-rate`. They are separate queues, so they do not have to contain the
   same sample blocks even though their x-axes use the same sample-rate basis.
@@ -80,5 +84,6 @@ FFT, and display pipeline.
   sample rate chosen during initialization. The audio queue is bounded by
   `--audio-buffer-seconds` so speaker latency and memory use stay bounded.
 - The main thread owns the Matplotlib GUI, drains the waterfall queue to compute
-  FFT rows, and drains the time-domain queue to plot I and Q sample amplitudes
-  above the waterfall.
+  FFT rows, and drains the time-domain queue into a rolling display buffer so
+  the I/Q graph always shows the last `--time-domain-samples` samples available
+  to the display.
