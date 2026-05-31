@@ -45,7 +45,7 @@ class ProcessingThread(threading.Thread):
 
             # These are intentionally independent handoff points. A processing
             # stage can choose to push different blocks into each display, while
-            # the sample rate represented by both remains the SDR sample rate.
+            # the sample rate represented by both remains the SDR baseband sample rate.
             if self.waterfall_queue is not None:
                 self.waterfall_queue.append(block)
             if self.time_domain_queue is not None:

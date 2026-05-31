@@ -22,7 +22,7 @@ python3 waterfall.py --center-freq 100.1e6
 
 Useful options:
 
-- `--sample-rate`: sample rate in samples/sec, default `2.4e6`.
+- `--bb-sample-rate`: RTL-SDR baseband sample rate in samples/sec, default `2400000`.
 - `--gain`: tuner gain in dB or `auto`, default `auto`.
 - `--fft-size`: samples used for each FFT waterfall row, default `2048`.
 - `--time-domain-samples` / `--iq-display-samples`: most recent I/Q samples shown in the time-domain graph above the waterfall, default `2048`.
@@ -71,10 +71,10 @@ FFT, and display pipeline.
   of the waterfall block size. This mirrors the intended processing-thread
   handoff model: downstream code can choose whether to append a block for the
   waterfall display, the time-domain display, both displays, or neither.
-- Both GUI handoff paths carry samples at the SDR sample rate configured by
-  `--sample-rate`. They are separate `IQSampleBuffer` instances, so they do not
+- Both GUI handoff paths carry samples at the SDR baseband sample rate configured by
+  `--bb-sample-rate`. They are separate `IQSampleBuffer` instances, so they do not
   have to contain the same sample blocks even though their x-axes use the same
-  sample-rate basis.
+  baseband-sample-rate basis.
 - The waterfall `IQSampleBuffer` is sized to
   `--display-update-samples * --display-queue-blocks` and drops oldest samples
   if the GUI falls behind, keeping waterfall generation recent and memory use
