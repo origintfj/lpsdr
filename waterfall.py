@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 from decimal import Decimal, InvalidOperation
 import importlib.util
+from pathlib import Path
 import signal
 import sys
 import threading
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class RadioConfig:
-    """Runtime configuration for the SDR and display pipeline."""
+    """Runtime configuration for the SDR, display, and optional audio pipeline."""
 
     # Frequencies and rates are stored in Hz so the values can be passed to the
     # rtl_sdr command without unit conversion surprises.
@@ -63,12 +64,94 @@ class RadioConfig:
     display_update_sample_count: int
     # Number of complex samples the reader tries to pull from rtl_sdr per read.
     read_size: int
+    # Number of FFT-sized blocks retained in the capture buffer.
+    buffer_blocks: int
+    # Number of display-update blocks retained for waterfall display rendering.
+    display_queue_blocks: int
     # Number of time-history rows kept in the Matplotlib image.
     waterfall_rows: int
     min_db: float
     max_db: float
     # Name or full path of the native rtl_sdr capture program.
     rtl_sdr_path: str
+    enable_audio: bool
+    audio_sample_rate: int
+    audio_block_size: int
+    audio_buffer_seconds: float
+    audio_device: str | int | None
+
+
+DEFAULT_CONFIG: dict[str, Any] = {
+    "center_freq": None,
+    "bb_sample_rate": 2_400_000,
+    "gain": "auto",
+    "fft_size": 2048,
+    "iq_display_sample_count": 2048,
+    "display_update_sample_count": 1024,
+    "read_size": 16_384,
+    "buffer_blocks": 32,
+    "display_queue_blocks": 8,
+    "waterfall_rows": 300,
+    "min_db": -80.0,
+    "max_db": 20.0,
+    "rtl_sdr_path": "rtl_sdr",
+    "enable_audio": False,
+    "audio_sample_rate": 48_000,
+    "audio_block_size": 1024,
+    "audio_buffer_seconds": 0.5,
+    "audio_device": None,
+}
+
+CONFIG_SECTION_KEYS: dict[str, dict[str, str]] = {
+    "radio": {
+        "center_freq": "center_freq",
+        "bb_sample_rate": "bb_sample_rate",
+        "sample_rate": "bb_sample_rate",
+        "gain": "gain",
+        "read_size": "read_size",
+        "rtl_sdr_path": "rtl_sdr_path",
+    },
+    "processing": {
+        "fft_size": "fft_size",
+        "buffer_blocks": "buffer_blocks",
+        "display_update_samples": "display_update_sample_count",
+        "display_update_sample_count": "display_update_sample_count",
+    },
+    "display": {
+        "time_domain_samples": "iq_display_sample_count",
+        "iq_display_samples": "iq_display_sample_count",
+        "iq_display_sample_count": "iq_display_sample_count",
+        "display_queue_blocks": "display_queue_blocks",
+        "waterfall_rows": "waterfall_rows",
+        "min_db": "min_db",
+        "max_db": "max_db",
+    },
+    "audio": {
+        "enable": "enable_audio",
+        "enabled": "enable_audio",
+        "enable_audio": "enable_audio",
+        "sample_rate": "audio_sample_rate",
+        "audio_sample_rate": "audio_sample_rate",
+        "block_size": "audio_block_size",
+        "audio_block_size": "audio_block_size",
+        "buffer_seconds": "audio_buffer_seconds",
+        "audio_buffer_seconds": "audio_buffer_seconds",
+        "device": "audio_device",
+        "audio_device": "audio_device",
+    },
+}
+
+FLAT_CONFIG_KEYS: dict[str, str] = {
+    key: key for key in DEFAULT_CONFIG
+}
+FLAT_CONFIG_KEYS.update(
+    {
+        "sample_rate": "bb_sample_rate",
+        "time_domain_samples": "iq_display_sample_count",
+        "iq_display_samples": "iq_display_sample_count",
+        "display_update_samples": "display_update_sample_count",
+    }
+)
 
 
 class RadioGui:
@@ -253,6 +336,300 @@ class RadioGui:
         return updated
 
 
+class ConfigError(ValueError):
+    """Raised when a YAML configuration file cannot be used."""
+
+
+def _normalize_config_key(key: object) -> str:
+    if not isinstance(key, str):
+        raise ConfigError(f"Configuration key {key!r} must be a string")
+    return key.replace("-", "_")
+
+
+def _strip_yaml_comment(line: str) -> str:
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    for index, char in enumerate(line):
+        if char == "\\" and in_double_quote and not escaped:
+            escaped = True
+            continue
+        if char == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+        elif char == '"' and not in_single_quote and not escaped:
+            in_double_quote = not in_double_quote
+        elif char == "#" and not in_single_quote and not in_double_quote:
+            return line[:index].rstrip()
+        escaped = False
+    return line.rstrip()
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    value = value.strip()
+    if value == "":
+        return ""
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+
+    lowered = value.lower()
+    if lowered in {"null", "~"}:
+        return None
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def parse_simple_yaml_mapping(text: str) -> dict[str, Any]:
+    """Parse the small YAML mapping subset used by the bundled template.
+
+    PyYAML is used when installed. This fallback intentionally supports the
+    configuration style this application writes and documents: top-level scalar
+    keys plus one level of nested mapping sections. It rejects lists and deeper
+    structures so unsupported YAML does not get misread silently.
+    """
+    root: dict[str, Any] = {}
+    current_section: dict[str, Any] | None = None
+    current_section_name: str | None = None
+
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        line = _strip_yaml_comment(raw_line)
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        if indent % 2 != 0:
+            raise ConfigError(
+                f"YAML line {line_number}: indentation must use pairs of spaces"
+            )
+        if line.lstrip().startswith("-"):
+            raise ConfigError(
+                f"YAML line {line_number}: lists are not supported here"
+            )
+        if ":" not in line:
+            raise ConfigError(f"YAML line {line_number}: expected a key/value pair")
+
+        key, value = line.strip().split(":", 1)
+        key = key.strip()
+        if not key:
+            raise ConfigError(f"YAML line {line_number}: key cannot be empty")
+
+        if indent == 0:
+            if value.strip() == "":
+                current_section = {}
+                current_section_name = key
+                root[key] = current_section
+            else:
+                current_section = None
+                current_section_name = None
+                root[key] = _parse_yaml_scalar(value)
+            continue
+
+        if indent == 2 and current_section is not None:
+            if value.strip() == "":
+                raise ConfigError(
+                    f"YAML line {line_number}: nested sections below "
+                    f"{current_section_name!r} are not supported"
+                )
+            current_section[key] = _parse_yaml_scalar(value)
+            continue
+
+        raise ConfigError(
+            f"YAML line {line_number}: only top-level keys and one nested mapping "
+            "level are supported without PyYAML"
+        )
+
+    return root
+
+
+def load_yaml_config(config_path: str | None) -> dict[str, Any]:
+    """Load radio settings from a YAML file and return canonical config keys."""
+    if config_path is None:
+        return {}
+
+    path = Path(config_path).expanduser()
+    text = path.read_text(encoding="utf-8")
+    if importlib.util.find_spec("yaml") is not None:
+        import yaml
+
+        try:
+            loaded = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            raise ConfigError(f"Could not parse YAML: {exc}") from exc
+    else:
+        loaded = parse_simple_yaml_mapping(text)
+
+    if loaded is None:
+        return {}
+    if not isinstance(loaded, dict):
+        raise ConfigError("Top-level YAML content must be a mapping")
+
+    config: dict[str, Any] = {}
+    for raw_key, value in loaded.items():
+        key = _normalize_config_key(raw_key)
+        if key in CONFIG_SECTION_KEYS:
+            if not isinstance(value, dict):
+                raise ConfigError(f"YAML section {raw_key!r} must be a mapping")
+            for section_raw_key, section_value in value.items():
+                section_key = _normalize_config_key(section_raw_key)
+                try:
+                    canonical_key = CONFIG_SECTION_KEYS[key][section_key]
+                except KeyError as exc:
+                    raise ConfigError(
+                        f"Unknown YAML option {section_raw_key!r} in section "
+                        f"{raw_key!r}"
+                    ) from exc
+                config[canonical_key] = section_value
+            continue
+
+        try:
+            canonical_key = FLAT_CONFIG_KEYS[key]
+        except KeyError as exc:
+            raise ConfigError(f"Unknown YAML option {raw_key!r}") from exc
+        config[canonical_key] = value
+
+    return config
+
+
+def _coerce_bool(value: Any, option_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+    raise ConfigError(f"{option_name} must be true or false")
+
+
+def _coerce_positive_int(value: Any, option_name: str) -> int:
+    if isinstance(value, bool):
+        raise ConfigError(f"{option_name} must be a positive integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{option_name} must be a positive integer") from exc
+    if parsed <= 0:
+        raise ConfigError(f"{option_name} must be greater than zero")
+    return parsed
+
+
+def _coerce_float(value: Any, option_name: str) -> float:
+    if isinstance(value, bool):
+        raise ConfigError(f"{option_name} must be a number")
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ConfigError(f"{option_name} must be a number") from exc
+
+
+def _coerce_integer_hz(value: Any, option_name: str) -> int:
+    try:
+        return parse_integer_hz(str(value))
+    except argparse.ArgumentTypeError as exc:
+        raise ConfigError(f"{option_name} must be an integer number of Hz") from exc
+
+
+def _coerce_gain(value: Any) -> str | float:
+    if isinstance(value, str):
+        try:
+            return parse_gain(value)
+        except ValueError as exc:
+            raise ConfigError("gain must be 'auto' or a tuner gain in dB") from exc
+    return _coerce_float(value, "gain")
+
+
+def cli_config_overrides(args: argparse.Namespace) -> dict[str, Any]:
+    """Return only command-line options explicitly supplied by the user."""
+    return {
+        key: value
+        for key, value in vars(args).items()
+        if key != "config" and value is not None
+    }
+
+
+def build_config(args: argparse.Namespace) -> RadioConfig:
+    """Merge defaults, YAML settings, and CLI overrides into RadioConfig."""
+    merged = DEFAULT_CONFIG | load_yaml_config(args.config) | cli_config_overrides(args)
+    if merged["center_freq"] is None:
+        raise ConfigError(
+            "center_freq is required; set it in YAML or with --center-freq"
+        )
+
+    center_freq = _coerce_float(merged["center_freq"], "center_freq")
+    bb_sample_rate = _coerce_integer_hz(merged["bb_sample_rate"], "bb_sample_rate")
+    gain = _coerce_gain(merged["gain"])
+    fft_size = _coerce_positive_int(merged["fft_size"], "fft_size")
+    iq_display_sample_count = _coerce_positive_int(
+        merged["iq_display_sample_count"], "iq_display_sample_count"
+    )
+    display_update_sample_count = _coerce_positive_int(
+        merged["display_update_sample_count"], "display_update_sample_count"
+    )
+    read_size = _coerce_positive_int(merged["read_size"], "read_size")
+    buffer_blocks = _coerce_positive_int(merged["buffer_blocks"], "buffer_blocks")
+    display_queue_blocks = _coerce_positive_int(
+        merged["display_queue_blocks"], "display_queue_blocks"
+    )
+    waterfall_rows = _coerce_positive_int(merged["waterfall_rows"], "waterfall_rows")
+    min_db = _coerce_float(merged["min_db"], "min_db")
+    max_db = _coerce_float(merged["max_db"], "max_db")
+    rtl_sdr_path = str(merged["rtl_sdr_path"])
+    enable_audio = _coerce_bool(merged["enable_audio"], "enable_audio")
+    audio_sample_rate = _coerce_positive_int(
+        merged["audio_sample_rate"], "audio_sample_rate"
+    )
+    audio_block_size = _coerce_positive_int(
+        merged["audio_block_size"], "audio_block_size"
+    )
+    audio_buffer_seconds = _coerce_float(
+        merged["audio_buffer_seconds"], "audio_buffer_seconds"
+    )
+    if audio_buffer_seconds <= 0:
+        raise ConfigError("audio_buffer_seconds must be greater than zero")
+    audio_device = merged["audio_device"]
+
+    max_buffer_samples = fft_size * buffer_blocks
+    if display_update_sample_count > max_buffer_samples:
+        raise ConfigError(
+            "display_update_sample_count cannot exceed fft_size * buffer_blocks"
+        )
+
+    return RadioConfig(
+        center_freq=center_freq,
+        bb_sample_rate=bb_sample_rate,
+        gain=gain,
+        fft_size=fft_size,
+        iq_display_sample_count=iq_display_sample_count,
+        display_update_sample_count=display_update_sample_count,
+        read_size=read_size,
+        buffer_blocks=buffer_blocks,
+        display_queue_blocks=display_queue_blocks,
+        waterfall_rows=waterfall_rows,
+        min_db=min_db,
+        max_db=max_db,
+        rtl_sdr_path=rtl_sdr_path,
+        enable_audio=enable_audio,
+        audio_sample_rate=audio_sample_rate,
+        audio_block_size=audio_block_size,
+        audio_buffer_seconds=audio_buffer_seconds,
+        audio_device=audio_device,
+    )
+
+
 def missing_runtime_dependencies(enable_audio: bool = False) -> list[str]:
     """Return Python packages needed to run the live waterfall that are missing."""
     # Checking with importlib keeps argument parsing usable in a fresh checkout;
@@ -291,16 +668,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Threaded RTL-SDR waterfall and time-domain display skeleton"
     )
     parser.add_argument(
+        "--config",
+        help="YAML configuration file; command-line options override YAML values",
+    )
+    parser.add_argument(
         "--center-freq",
         type=float,
-        required=True,
+        default=None,
         help="Center frequency in Hz, e.g. 100.1e6",
     )
     parser.add_argument(
         "--bb-sample-rate",
         dest="bb_sample_rate",
         type=parse_integer_hz,
-        default=2_400_000,
+        default=None,
         help="RTL-SDR baseband sample rate in samples/sec",
     )
     parser.add_argument(
@@ -312,13 +693,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gain",
         type=parse_gain,
-        default="auto",
+        default=None,
         help="Tuner gain in dB or 'auto'",
     )
     parser.add_argument(
         "--fft-size",
         type=int,
-        default=2048,
+        default=None,
         help="Number of samples per FFT row",
     )
     parser.add_argument(
@@ -326,13 +707,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--iq-display-samples",
         dest="iq_display_sample_count",
         type=int,
-        default=2048,
+        default=None,
         help="Number of most recent I/Q samples shown in the time-domain graph",
     )
     parser.add_argument(
         "--display-update-samples",
         type=int,
-        default=1024,
+        default=None,
         help=(
             "Fresh I/Q samples routed to GUI display handoff points per "
             "processing pass; "
@@ -342,19 +723,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--read-size",
         type=int,
-        default=16_384,
+        default=None,
         help="Complex samples read from rtl_sdr at a time",
     )
     parser.add_argument(
         "--buffer-blocks",
         type=int,
-        default=32,
+        default=None,
         help="Number of FFT-sized blocks retained in the I/Q buffer",
     )
     parser.add_argument(
         "--display-queue-blocks",
         type=int,
-        default=8,
+        default=None,
         help=(
             "Waterfall display buffer capacity measured in "
             "--display-update-samples blocks"
@@ -363,47 +744,48 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--waterfall-rows",
         type=int,
-        default=300,
+        default=None,
         help="Number of rows in the waterfall history",
     )
     parser.add_argument(
         "--min-db",
         type=float,
-        default=-80.0,
+        default=None,
         help="Waterfall color scale minimum",
     )
     parser.add_argument(
         "--max-db",
         type=float,
-        default=20.0,
+        default=None,
         help="Waterfall color scale maximum",
     )
     parser.add_argument(
         "--rtl-sdr-path",
-        default="rtl_sdr",
+        default=None,
         help="Path to the rtl_sdr executable used for sample capture",
     )
     parser.add_argument(
         "--enable-audio",
         action="store_true",
+        default=None,
         help="Enable a simple mono audio monitor from processed samples",
     )
     parser.add_argument(
         "--audio-sample-rate",
         type=int,
-        default=48_000,
+        default=None,
         help="Audio playback sample rate in samples/sec",
     )
     parser.add_argument(
         "--audio-block-size",
         type=int,
-        default=1024,
+        default=None,
         help="Audio samples written to the sound device per block",
     )
     parser.add_argument(
         "--audio-buffer-seconds",
         type=float,
-        default=0.5,
+        default=None,
         help="Maximum queued audio backlog in seconds",
     )
     parser.add_argument(
@@ -416,7 +798,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_arg_parser().parse_args()
-    missing_packages = missing_runtime_dependencies(enable_audio=args.enable_audio)
+
+    try:
+        config = build_config(args)
+    except (ConfigError, OSError) as exc:
+        print(f"Configuration error: {exc}", file=sys.stderr)
+        return 2
+
+    missing_packages = missing_runtime_dependencies(enable_audio=config.enable_audio)
     if missing_packages:
         print(
             "Missing Python package(s): "
@@ -426,45 +815,7 @@ def main() -> int:
         )
         return 2
 
-    if args.bb_sample_rate <= 0:
-        print("--bb-sample-rate must be greater than zero", file=sys.stderr)
-        return 2
-    if args.fft_size <= 0:
-        print("--fft-size must be greater than zero", file=sys.stderr)
-        return 2
-    if args.buffer_blocks <= 0:
-        print("--buffer-blocks must be greater than zero", file=sys.stderr)
-        return 2
-    if args.iq_display_sample_count <= 0:
-        print("--time-domain-samples must be greater than zero", file=sys.stderr)
-        return 2
-    if args.display_update_samples <= 0:
-        print("--display-update-samples must be greater than zero", file=sys.stderr)
-        return 2
-    max_buffer_samples = args.fft_size * args.buffer_blocks
-    if args.display_update_samples > max_buffer_samples:
-        print(
-            "--display-update-samples cannot exceed --fft-size * --buffer-blocks",
-            file=sys.stderr,
-        )
-        return 2
-    if args.display_queue_blocks <= 0:
-        print("--display-queue-blocks must be greater than zero", file=sys.stderr)
-        return 2
-
-    config = RadioConfig(
-        center_freq=args.center_freq,
-        bb_sample_rate=args.bb_sample_rate,
-        gain=args.gain,
-        fft_size=args.fft_size,
-        iq_display_sample_count=args.iq_display_sample_count,
-        display_update_sample_count=args.display_update_samples,
-        read_size=args.read_size,
-        waterfall_rows=args.waterfall_rows,
-        min_db=args.min_db,
-        max_db=args.max_db,
-        rtl_sdr_path=args.rtl_sdr_path,
-    )
+    max_buffer_samples = config.fft_size * config.buffer_blocks
 
     stop_event = threading.Event()
     # All I/Q handoffs use the same bounded sample-buffer type. The capture
@@ -473,23 +824,23 @@ def main() -> int:
     # by the number of samples shown in that graph.
     sample_buffer = IQSampleBuffer(max_samples=max_buffer_samples)
     waterfall_queue = IQSampleBuffer(
-        max_samples=args.display_update_samples * args.display_queue_blocks,
+        max_samples=config.display_update_sample_count * config.display_queue_blocks,
     )
-    time_domain_queue = IQSampleBuffer(max_samples=args.iq_display_sample_count)
+    time_domain_queue = IQSampleBuffer(max_samples=config.iq_display_sample_count)
     audio_queue: AudioSampleQueue | None = None
     audio_thread: AudioPlaybackThread | None = None
-    if args.enable_audio:
+    if config.enable_audio:
         max_audio_samples = max(
-            args.audio_block_size,
-            round(args.audio_sample_rate * args.audio_buffer_seconds),
+            config.audio_block_size,
+            round(config.audio_sample_rate * config.audio_buffer_seconds),
         )
         audio_queue = AudioSampleQueue(max_samples=max_audio_samples)
         audio_thread = AudioPlaybackThread(
             audio_queue,
-            sample_rate=args.audio_sample_rate,
-            block_size=args.audio_block_size,
+            sample_rate=config.audio_sample_rate,
+            block_size=config.audio_block_size,
             stop_event=stop_event,
-            device=args.audio_device,
+            device=config.audio_device,
         )
 
     def request_shutdown(signum: int, _: object) -> None:

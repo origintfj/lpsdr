@@ -20,7 +20,32 @@ Select the center frequency in Hz:
 python3 waterfall.py --center-freq 100.1e6
 ```
 
+You can also put the radio, processing, display, and audio settings in a YAML
+file and run with `--config`:
+
+```bash
+cp radio_config.template.yaml radio_config.yaml
+# Edit radio_config.yaml, especially radio.center_freq.
+python3 waterfall.py --config radio_config.yaml
+```
+
+Command-line options remain available and override values loaded from YAML, so
+you can keep a baseline file and temporarily tune individual settings:
+
+```bash
+python3 waterfall.py --config radio_config.yaml --center-freq 102.5e6 --gain auto
+```
+
+The template file, `radio_config.template.yaml`, documents every supported YAML
+option. The preferred structure uses `radio`, `processing`, `display`, and
+`audio` sections. Hyphenated keys are accepted as aliases for underscored keys.
+The application can parse this documented mapping format without extra packages;
+if PyYAML is installed, it will be used automatically for broader YAML syntax.
+
 Useful options:
+
+- `--config`: YAML configuration file. Values provided on the command line
+  override values from the file.
 
 - `--bb-sample-rate`: RTL-SDR baseband sample rate in samples/sec, default `2400000`.
 - `--gain`: tuner gain in dB or `auto`, default `auto`.
