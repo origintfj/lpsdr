@@ -53,8 +53,12 @@ class RadioConfig:
     # One FFT is computed from this many complex I/Q samples. Larger values give
     # better frequency resolution but update the waterfall more slowly.
     fft_size: int
-    # Number of complex samples shown in the time-domain graph.
-    time_domain_samples: int
+    # Number of complex samples shown in the time-domain I/Q graph.
+    iq_display_sample_count: int
+    # Number of fresh complex samples routed to displays per processing pass.
+    # This controls GUI update granularity independently from the FFT size used
+    # to build waterfall rows.
+    display_update_sample_count: int
     # Number of complex samples the reader tries to pull from rtl_sdr per read.
     read_size: int
     # Number of time-history rows kept in the Matplotlib image.
@@ -141,7 +145,7 @@ class SampleRouterThread(threading.Thread):
     def run(self) -> None:
         while not self.stop_event.is_set():
             block = self.sample_buffer.wait_for_samples(
-                self.config.fft_size,
+                self.config.display_update_sample_count,
                 self.stop_event,
             )
             if block is None:
@@ -195,7 +199,10 @@ class WaterfallDisplay:
             dtype=np.float32,
         )
         self._waterfall_pending = np.empty(0, dtype=np.complex64)
-        self._time_domain = np.zeros(config.time_domain_samples, dtype=np.complex64)
+        self._time_domain = np.zeros(
+            config.iq_display_sample_count,
+            dtype=np.complex64,
+        )
         self.window = np.hanning(config.fft_size).astype(np.float32)
         self.figure, (self.time_axis, self.waterfall_axis) = plt.subplots(
             2,
@@ -225,7 +232,7 @@ class WaterfallDisplay:
         import numpy as np
 
         return (
-            np.arange(self.config.time_domain_samples, dtype=np.float32)
+            np.arange(self.config.iq_display_sample_count, dtype=np.float32)
             / self.config.sample_rate
             * 1_000.0
         )
@@ -307,15 +314,11 @@ class WaterfallDisplay:
         if not blocks:
             return False
 
-        latest = blocks[-1]
-        if latest.size >= self.config.time_domain_samples:
-            self._time_domain = latest[-self.config.time_domain_samples :]
-        else:
-            self._time_domain = np.zeros(
-                self.config.time_domain_samples,
-                dtype=np.complex64,
-            )
-            self._time_domain[-latest.size :] = latest
+        samples = np.concatenate([self._time_domain, *blocks]).astype(
+            np.complex64,
+            copy=False,
+        )
+        self._time_domain = samples[-self.config.iq_display_sample_count :]
 
         if self.i_line is not None and self.q_line is not None:
             self.i_line.set_ydata(self._time_domain.real)
@@ -405,9 +408,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--time-domain-samples",
+        "--iq-display-samples",
+        dest="iq_display_sample_count",
         type=int,
         default=2048,
-        help="Number of I/Q samples shown in the time-domain graph",
+        help="Number of most recent I/Q samples shown in the time-domain graph",
+    )
+    parser.add_argument(
+        "--display-update-samples",
+        type=int,
+        default=1024,
+        help=(
+            "Fresh I/Q samples routed to GUI display queues per processing pass; "
+            "independent of --fft-size"
+        ),
     )
     parser.add_argument(
         "--read-size",
@@ -499,8 +513,24 @@ def main() -> int:
         )
         return 2
 
-    if args.time_domain_samples <= 0:
+    if args.fft_size <= 0:
+        print("--fft-size must be greater than zero", file=sys.stderr)
+        return 2
+    if args.buffer_blocks <= 0:
+        print("--buffer-blocks must be greater than zero", file=sys.stderr)
+        return 2
+    if args.iq_display_sample_count <= 0:
         print("--time-domain-samples must be greater than zero", file=sys.stderr)
+        return 2
+    if args.display_update_samples <= 0:
+        print("--display-update-samples must be greater than zero", file=sys.stderr)
+        return 2
+    max_buffer_samples = args.fft_size * args.buffer_blocks
+    if args.display_update_samples > max_buffer_samples:
+        print(
+            "--display-update-samples cannot exceed --fft-size * --buffer-blocks",
+            file=sys.stderr,
+        )
         return 2
     if args.display_queue_blocks <= 0:
         print("--display-queue-blocks must be greater than zero", file=sys.stderr)
@@ -511,7 +541,8 @@ def main() -> int:
         sample_rate=args.sample_rate,
         gain=args.gain,
         fft_size=args.fft_size,
-        time_domain_samples=args.time_domain_samples,
+        iq_display_sample_count=args.iq_display_sample_count,
+        display_update_sample_count=args.display_update_samples,
         read_size=args.read_size,
         waterfall_rows=args.waterfall_rows,
         min_db=args.min_db,
@@ -523,7 +554,7 @@ def main() -> int:
     # The sample buffer bridges the reader and processing thread. The two GUI
     # queues are independent handoff points: processing code can push one sample
     # block stream for waterfall FFTs and another stream for the time-domain plot.
-    sample_buffer = IQSampleBuffer(max_samples=args.fft_size * args.buffer_blocks)
+    sample_buffer = IQSampleBuffer(max_samples=max_buffer_samples)
     waterfall_queue = IQDisplaySampleQueue(max_blocks=args.display_queue_blocks)
     time_domain_queue = IQDisplaySampleQueue(max_blocks=args.display_queue_blocks)
     audio_queue: AudioSampleQueue | None = None
