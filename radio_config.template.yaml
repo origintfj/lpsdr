@@ -10,7 +10,7 @@
 radio:
   # Required: RF center frequency in Hz. Scientific notation may be quoted for
   # maximum YAML parser compatibility.
-  center_freq: "100.1e6"
+  center_freq: "30e6"
 
   # RTL-SDR baseband sample rate in complex I/Q samples per second.
   bb_sample_rate: 2400000
@@ -48,12 +48,12 @@ display:
   waterfall_rows: 300
 
   # Waterfall color scale bounds in relative dB.
-  min_db: -80.0
-  max_db: 20.0
+  min_db: 20.0
+  max_db: 40.0
 
 audio:
   # Enable a simple mono audio monitor from processed sample real values.
-  enable: false
+  enable: true
 
   # Speaker playback rate in samples per second.
   sample_rate: 48000
