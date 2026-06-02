@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import queue
+from typing import Any
 
 import numpy as np
-import sounddevice as sd
+
+
+def load_sounddevice() -> Any:
+    """Load sounddevice only when audio playback is started."""
+    import sounddevice
+
+    return sounddevice
 
 
 class AudioPlayer:
@@ -18,7 +25,8 @@ class AudioPlayer:
         block_size: int,
     ) -> None:
         self._audio_queue = audio_queue
-        self._stream = sd.OutputStream(
+        sounddevice = load_sounddevice()
+        self._stream = sounddevice.OutputStream(
             samplerate=sample_rate_hz,
             channels=1,
             dtype="float32",

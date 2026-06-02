@@ -17,6 +17,8 @@ python -m pip install -e .
 
 You will also need RTL-SDR system libraries and an available audio device.
 
+Current `pyrtlsdr` releases still import `pkg_resources`, which can emit a deprecation warning in Python 3.13 virtual environments with recent `setuptools` versions. The package pins `setuptools<81`, and `lpsdr.radio` also loads `rtlsdr` lazily while suppressing only that compatibility warning at runtime.
+
 ## Run
 
 ```bash
