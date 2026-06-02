@@ -1,6 +1,6 @@
 # lpsdr
 
-A small Python RTL-SDR waterfall and time-domain I/Q display skeleton that reads samples through the standard `rtl_sdr` command-line program.
+A small Python RTL-SDR waterfall and time-domain I/Q display skeleton that reads samples through the `pyrtlsdr` Python bindings.
 
 ## Setup
 
@@ -10,7 +10,7 @@ Install the Python dependencies:
 python3 -m pip install -r requirements.txt
 ```
 
-The application expects an RTL-SDR device and the `rtl_sdr` executable from the native `rtl-sdr` tools to be available on the host system. It intentionally does not use the `pyrtlsdr` Python bindings, avoiding version mismatches such as missing `librtlsdr` symbols.
+The application expects an RTL-SDR device plus the native `librtlsdr` library to be available on the host system so the `pyrtlsdr` Python bindings can open the dongle directly.
 
 ## Run
 
@@ -55,7 +55,6 @@ Useful options:
 - `--display-queue-blocks`: waterfall display buffer capacity measured in `--display-update-samples` blocks, default `8`. The time-domain I/Q buffer is sized only by `--time-domain-samples` / `--iq-display-samples`.
 - `--waterfall-rows`: displayed waterfall history rows, default `300`.
 - `--min-db` / `--max-db`: color scale bounds.
-- `--rtl-sdr-path`: executable used for capture, default `rtl_sdr`.
 - `--enable-audio`: start an audio playback thread that monitors processed
   samples through the speakers.
 - `--audio-sample-rate`: speaker playback rate, default `48000`.
@@ -66,12 +65,11 @@ Useful options:
 
 ## I/Q sample resolution
 
-The `rtl_sdr` tool used by this example streams interleaved unsigned 8-bit I/Q
-bytes: one byte for I, then one byte for Q, repeated for each complex sample.
-For ordinary RTL-SDR dongles this is effectively the hardware/tool sample
-format, not a resolution chosen by this Python script. The script converts those
-8-bit byte values into floating-point complex numbers before the FFT so NumPy can
-process them conveniently, but that conversion does not add ADC resolution.
+The RTL-SDR hardware exposes interleaved unsigned 8-bit I/Q measurements: one
+byte for I, then one byte for Q, repeated for each complex sample. `pyrtlsdr`
+normalizes those measurements into floating-point complex samples before they
+enter the application buffer, which makes NumPy FFT processing convenient but
+does not add ADC resolution.
 
 Other SDR families can have wider ADCs or different host sample formats. To use
 one of those devices, replace `SDRReaderThread` in `sdr_reader.py` with a
@@ -80,9 +78,9 @@ FFT, and display pipeline.
 
 ## Threading model
 
-- `sdr_reader.SDRReaderThread` launches `rtl_sdr`, converts interleaved unsigned
-  8-bit I/Q bytes into complex samples, and appends them to a thread-safe
-  `sdr_reader.IQSampleBuffer`.
+- `sdr_reader.SDRReaderThread` opens the RTL-SDR through `pyrtlsdr`, starts a
+  librtlsdr asynchronous sample stream, and appends normalized complex samples
+  to a thread-safe `sdr_reader.IQSampleBuffer`.
 - `IQSampleBuffer` is initialized with a fixed maximum sample count (the
   `--fft-size` multiplied by `--buffer-blocks`) so capture backlog memory remains
   bounded. Its `wait_for_samples(sample_count, stop_event)` method lets a
