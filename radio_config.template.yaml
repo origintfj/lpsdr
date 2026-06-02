@@ -10,7 +10,7 @@
 radio:
   # Required: RF center frequency in Hz. Scientific notation may be quoted for
   # maximum YAML parser compatibility.
-  center_freq: "30e6"
+  center_freq: "97.2e6"
 
   # RTL-SDR baseband sample rate in complex I/Q samples per second.
   bb_sample_rate: 2400000

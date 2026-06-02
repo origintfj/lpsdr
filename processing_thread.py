@@ -106,24 +106,33 @@ class ProcessingThread(threading.Thread):
 
         while not self.stop_event.is_set():
             block = self.sample_buffer.wait_for_samples(
-                5000,#self.config.display_update_sample_count,
+                1000,#self.config.display_update_sample_count,
                 self.stop_event,
             )
             if block is None:
                 continue
 
-            n = self.bb_stream.append(block)
-            bb_frame, n = self.bb_stream.convolve_rev(lpf_rev)  # complex64, length = need_raw
-            self.bb_stream.remove(n)
+            x = np.convolve(block, lpf, mode="same")  # complex64, length = need_raw
 
-            bb_frame = bb_frame[::50]
-            bb_frame = block[::50]
+            #n = self.bb_stream.append(block)
+            #bb_frame, n = self.bb_stream.convolve_rev(lpf_rev)  # complex64, length = need_raw
+            #self.bb_stream.remove(n)
+            #x = bb_frame
+
+            phase    = np.angle(x)
+            phase_uw = np.unwrap(phase)
+            phase_uw_lpf = phase_uw
+            dp = np.diff(phase_uw_lpf[::50])
+            y = dp / 4 / np.pi
+
+            #bb_frame = bb_frame[::50]
+            #bb_frame = block[::50]
 
             #self.bb_lpf_stream.append(bb_frame)
             #bb_frame, n = self.bb_lpf_stream.dphase()
             #self.bb_lpf_stream.remove(n)
 
-            #bb_frame = block
+            bb_frame = y
 
             # These are intentionally independent handoff points. A processing
             # stage can choose to push different blocks into each display, while
