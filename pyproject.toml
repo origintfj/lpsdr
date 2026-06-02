@@ -1,0 +1,18 @@
+[project]
+name = "lpsdr"
+version = "0.1.0"
+description = "Lightweight RTL-SDR to audio playback skeleton"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pyrtlsdr>=0.3.0",
+    "sounddevice>=0.4.6",
+]
+
+[project.scripts]
+lpsdr = "lpsdr.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
