@@ -1,8 +1,8 @@
 """SDR capture thread and bounded I/Q sample handoff buffer.
 
 The classes in this module form the producer side of the waterfall pipeline:
-``SDRReaderThread`` reads raw bytes from the ``rtl_sdr`` command-line tool,
-converts them to complex I/Q samples, and appends them to ``IQSampleBuffer``.
+``SDRReaderThread`` streams complex I/Q samples directly from ``pyrtlsdr``
+and appends them to ``IQSampleBuffer``.
 Consumers can then make one blocking call that states exactly how many fresh
 samples they need before processing can continue, or drain whatever samples are
 currently available for non-blocking display updates.
@@ -10,8 +10,6 @@ currently available for non-blocking display updates.
 
 from __future__ import annotations
 
-import shutil
-import subprocess
 import sys
 import threading
 from collections import deque
@@ -28,7 +26,6 @@ class SDRReaderConfig(Protocol):
     bb_sample_rate: int
     gain: str | float
     read_size: int
-    rtl_sdr_path: str
 
 
 class IQSampleBuffer:
@@ -126,7 +123,7 @@ class IQSampleBuffer:
 
 
 class SDRReaderThread(threading.Thread):
-    """Continuously read samples from rtl_sdr into an ``IQSampleBuffer``."""
+    """Continuously read samples from pyrtlsdr into an ``IQSampleBuffer``."""
 
     def __init__(
         self,
@@ -138,12 +135,12 @@ class SDRReaderThread(threading.Thread):
         self.config = config
         self.sample_buffer = sample_buffer
         self.stop_event = stop_event
-        self._process: subprocess.Popen[bytes] | None = None
-        self._process_lock = threading.Lock()
+        self._sdr: Any | None = None
+        self._sdr_lock = threading.Lock()
 
     def run(self) -> None:
         try:
-            self._read_from_rtl_sdr()
+            self._read_from_pyrtlsdr()
         except Exception as exc:
             # Any capture failure should stop the whole pipeline; otherwise the
             # FFT and GUI threads would sit idle waiting for samples forever.
@@ -151,83 +148,56 @@ class SDRReaderThread(threading.Thread):
             self.stop_event.set()
         finally:
             self.stop()
+            self._close_sdr()
             self.sample_buffer.wake_waiters()
 
     def stop(self) -> None:
-        """Terminate the rtl_sdr child process, if it is still running."""
-        with self._process_lock:
-            process = self._process
-        if process is None or process.poll() is not None:
+        """Cancel any active pyrtlsdr async read."""
+        with self._sdr_lock:
+            sdr = self._sdr
+        if sdr is None:
             return
-        # Ask rtl_sdr to exit gracefully first. If it is blocked in a USB read,
-        # fall back to kill so the Python process can still shut down promptly.
-        process.terminate()
+
         try:
-            process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=2.0)
+            if not getattr(sdr, "read_async_canceling", False):
+                sdr.cancel_read_async()
+        except Exception:
+            # The async read may already have returned because the device was
+            # unplugged or the callback requested cancellation. The reader
+            # thread will still close the SDR handle from its own finally block.
+            pass
 
-    def _read_from_rtl_sdr(self) -> None:
-        import numpy as np
+    def _close_sdr(self) -> None:
+        with self._sdr_lock:
+            sdr = self._sdr
+            self._sdr = None
+        if sdr is not None:
+            sdr.close()
 
-        rtl_sdr = shutil.which(self.config.rtl_sdr_path)
-        if rtl_sdr is None:
-            raise RuntimeError(
-                f"Could not find '{self.config.rtl_sdr_path}'. Install rtl-sdr "
-                "or pass --rtl-sdr-path with the full executable path."
-            )
+    def _read_from_pyrtlsdr(self) -> None:
+        from rtlsdr import RtlSdr
 
-        # `rtl_sdr ... -` writes raw I/Q bytes to stdout. The center frequency is
-        # rounded because the CLI expects integer Hz; the baseband sample rate is
-        # already parsed as an integer.
-        command = [
-            rtl_sdr,
-            "-f",
-            str(round(self.config.center_freq)),
-            "-s",
-            str(self.config.bb_sample_rate),
-        ]
-        gain_is_auto = (
-            isinstance(self.config.gain, str)
-            and self.config.gain.lower() == "auto"
-        )
-        if not gain_is_auto:
-            command.extend(["-g", str(self.config.gain)])
-        command.append("-")
+        sdr = RtlSdr()
+        with self._sdr_lock:
+            self._sdr = sdr
 
-        # Only stdout is piped. rtl_sdr's status messages remain on stderr so
-        # users can still see hardware errors and tuning messages in the shell.
-        process = subprocess.Popen(command, stdout=subprocess.PIPE)
-        with self._process_lock:
-            self._process = process
+        # Configure the dongle through librtlsdr directly instead of launching
+        # the rtl_sdr command-line program and reading from a stdout pipe. The
+        # pyrtlsdr async reader keeps libusb's transfer queue inside the driver
+        # path, avoiding the extra process/pipe hop that can create gaps when
+        # Python waits between fixed-size stdout reads.
+        sdr.sample_rate = self.config.bb_sample_rate
+        sdr.center_freq = round(self.config.center_freq)
+        sdr.gain = self.config.gain
 
-        # rtl_sdr emits two unsigned bytes per complex sample: I, then Q. For
-        # RTL-SDR dongles this is not a selectable output depth in this script;
-        # it reflects the native 8-bit sample format exposed by the RTL2832U
-        # hardware/rtl_sdr tool. Different SDR hardware may support wider ADCs,
-        # but this rtl_sdr-based reader is intentionally written for the common
-        # 8-bit RTL-SDR byte stream.
-        bytes_per_read = self.config.read_size * 2
-        while not self.stop_event.is_set():
-            if process.stdout is None:
-                raise RuntimeError("rtl_sdr stdout pipe was not created")
+        def append_samples(samples: Any, context: Any) -> None:
+            del context
+            if self.stop_event.is_set():
+                sdr.cancel_read_async()
+                return
+            self.sample_buffer.append(samples)
 
-            raw = process.stdout.read(bytes_per_read)
-            if not raw:
-                exit_code = process.poll()
-                raise RuntimeError(
-                    f"rtl_sdr exited before samples were available: {exit_code}"
-                )
-            if len(raw) < bytes_per_read:
-                continue
-
-            # Convert [I0, Q0, I1, Q1, ...] from unsigned 8-bit integers into
-            # complex64 samples centered near 0.0. The 127.5 midpoint maps the
-            # byte range 0..255 to approximately -1.0..+1.0; converting to
-            # float/complex64 makes the later FFT math convenient, but it does
-            # not add resolution beyond the original 8-bit measurements.
-            interleaved = np.frombuffer(raw, dtype=np.uint8).astype(np.float32)
-            normalized = (interleaved - 127.5) / 127.5
-            iq_samples = normalized[0::2] + 1j * normalized[1::2]
-            self.sample_buffer.append(iq_samples)
+        # read_samples_async blocks until cancel_read_async() is called. The
+        # callback receives already-normalized complex samples from pyrtlsdr, so
+        # this thread only has to append them into the bounded handoff buffer.
+        sdr.read_samples_async(append_samples, self.config.read_size)

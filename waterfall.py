@@ -6,13 +6,11 @@ RTL-SDR device, a processing thread to route sample blocks into display/audio
 buffers, and the main Matplotlib GUI thread to render both a live time-domain I/Q
 plot and a live waterfall display.
 
-The reader uses the standard ``rtl_sdr`` command-line program rather than the
-``pyrtlsdr`` Python bindings. That keeps the skeleton compatible with systems
-where the installed Python package expects newer ``librtlsdr`` symbols than the
-host library provides.
+The reader uses the ``pyrtlsdr`` Python bindings to stream samples directly
+from librtlsdr instead of launching the ``rtl_sdr`` command-line program.
 
 Dependencies:
-    pip install numpy matplotlib
+    pip install numpy matplotlib pyrtlsdr
 
 Example:
     python3 waterfall.py --center-freq 100.1e6 --bb-sample-rate 2400000 --gain auto
@@ -47,8 +45,8 @@ if TYPE_CHECKING:
 class RadioConfig:
     """Runtime configuration for the SDR, display, and optional audio pipeline."""
 
-    # Frequencies and rates are stored in Hz so the values can be passed to the
-    # rtl_sdr command without unit conversion surprises.
+    # Frequencies and rates are stored in Hz so values can be passed directly to
+    # pyrtlsdr/librtlsdr without unit conversion surprises.
     center_freq: float
     # Baseband sample rate from the SDR, distinct from audio playback sample rate.
     bb_sample_rate: int
@@ -62,7 +60,7 @@ class RadioConfig:
     # This controls GUI update granularity independently from the FFT size used
     # to build waterfall rows.
     display_update_sample_count: int
-    # Number of complex samples the reader tries to pull from rtl_sdr per read.
+    # Number of complex samples requested for each pyrtlsdr async callback.
     read_size: int
     # Number of FFT-sized blocks retained in the capture buffer.
     buffer_blocks: int
@@ -72,7 +70,7 @@ class RadioConfig:
     waterfall_rows: int
     min_db: float
     max_db: float
-    # Name or full path of the native rtl_sdr capture program.
+    # Deprecated compatibility option retained for older YAML/CLI configs.
     rtl_sdr_path: str
     enable_audio: bool
     audio_sample_rate: int
@@ -634,7 +632,7 @@ def missing_runtime_dependencies(enable_audio: bool = False) -> list[str]:
     """Return Python packages needed to run the live waterfall that are missing."""
     # Checking with importlib keeps argument parsing usable in a fresh checkout;
     # the expensive imports happen only after we know the packages are present.
-    required_packages = ["numpy", "matplotlib"]
+    required_packages = ["numpy", "matplotlib", "rtlsdr"]
     if enable_audio:
         required_packages.append("sounddevice")
     return [
@@ -724,7 +722,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--read-size",
         type=int,
         default=None,
-        help="Complex samples read from rtl_sdr at a time",
+        help="Complex samples requested for each pyrtlsdr async callback",
     )
     parser.add_argument(
         "--buffer-blocks",
@@ -762,7 +760,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rtl-sdr-path",
         default=None,
-        help="Path to the rtl_sdr executable used for sample capture",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--enable-audio",
@@ -846,8 +844,8 @@ def main() -> int:
     def request_shutdown(signum: int, _: object) -> None:
         print(f"Received signal {signum}; shutting down...")
         stop_event.set()
-        # Terminating the child process unblocks the reader if it is stuck in a
-        # blocking stdout read, while wake_waiters releases blocking conditions.
+        # Cancelling the async read unblocks the reader, while wake_waiters
+        # releases blocking conditions.
         reader.stop()
         sample_buffer.wake_waiters()
         if audio_queue is not None:
@@ -875,7 +873,7 @@ def main() -> int:
         RadioGui(config, waterfall_queue, time_domain_queue).start(stop_event)
     finally:
         # The GUI runs on the main thread. When it exits, always ask the worker
-        # threads to stop and wait briefly so the rtl_sdr process is cleaned up.
+        # threads to stop and wait briefly so the pyrtlsdr device is cleaned up.
         stop_event.set()
         reader.stop()
         sample_buffer.wake_waiters()

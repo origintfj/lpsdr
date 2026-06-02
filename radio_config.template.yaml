@@ -18,10 +18,10 @@ radio:
   # Tuner gain in dB, or "auto" for automatic tuner gain.
   gain: auto
 
-  # Complex I/Q samples read from rtl_sdr per stdout read.
+  # Complex I/Q samples requested for each pyrtlsdr async callback.
   read_size: 16384
 
-  # Name or full path of the native rtl_sdr executable.
+  # Deprecated compatibility key. Sample capture now uses pyrtlsdr directly.
   rtl_sdr_path: rtl_sdr
 
 processing:
