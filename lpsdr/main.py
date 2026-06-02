@@ -69,9 +69,14 @@ def main() -> None:
         processor.start()
 
         with AudioPlayer(audio_queue, args.sample_rate, args.chunk_size):
-            stop_event.wait()
+            print("lpsdr running; press Ctrl-C to stop", flush=True)
+            while not stop_event.is_set():
+                if processor.done_event.wait(timeout=0.25):
+                    break
 
         processor.join(timeout=2.0)
+        if processor.error is not None:
+            raise RuntimeError("SDR processing thread stopped unexpectedly") from processor.error
 
 
 if __name__ == "__main__":

@@ -28,17 +28,25 @@ class ProcessingThread(threading.Thread):
         config: ProcessingConfig,
         stop_event: threading.Event,
     ) -> None:
-        super().__init__(name="sdr-processing", daemon=True)
+        super().__init__(name="sdr-processing")
         self._sample_source = sample_source
         self._audio_queue = audio_queue
         self._config = config
         self._stop_event = stop_event
+        self.done_event = threading.Event()
+        self.error: BaseException | None = None
 
     def run(self) -> None:
-        while not self._stop_event.is_set():
-            iq_samples = self._sample_source.next_samples(self._config.chunk_size)
-            audio_samples = self._process(iq_samples)
-            self._enqueue_audio(audio_samples)
+        try:
+            while not self._stop_event.is_set():
+                iq_samples = self._sample_source.next_samples(self._config.chunk_size)
+                audio_samples = self._process(iq_samples)
+                self._enqueue_audio(audio_samples)
+        except BaseException as exc:
+            self.error = exc
+            self._stop_event.set()
+        finally:
+            self.done_event.set()
 
     def _enqueue_audio(self, audio_samples: np.ndarray) -> None:
         while not self._stop_event.is_set():

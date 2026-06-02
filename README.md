@@ -24,3 +24,7 @@ Current `pyrtlsdr` releases still import `pkg_resources`, which can emit a depre
 ```bash
 lpsdr --center-freq 100000000 --sample-rate 48000 --gain auto --chunk-size 1024
 ```
+
+## Runtime behavior
+
+After the SDR and audio stream open successfully, the application prints `lpsdr running; press Ctrl-C to stop` and remains active until it receives `SIGINT` or `SIGTERM`. If it exits before that message, startup failed while opening the RTL-SDR or audio device. If the processing thread stops after startup, `main()` re-raises that thread error instead of silently exiting.
